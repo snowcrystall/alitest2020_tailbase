@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "/pb";
+service AgentService {
+    rpc NotifyTargetTraceid(TraceidRequest) returns (Reply) {}
+}
+service ProcessService {
+    rpc SetTargetTraceid(TraceidRequest) returns (Reply) {}
+    rpc SendTraceData(stream TraceData) returns (Reply) {}
+    rpc NotifySendOver(Addr) returns(Reply){}
+}
+message TraceData {
+    string tracedata = 1;
+}
+message Reply {
+    string reply = 1;
+}
+message Addr {
+    string addr = 1;
+}
+message TraceidRequest {
+    string traceid = 1;
+}
+
