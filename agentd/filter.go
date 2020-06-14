@@ -1,143 +1,199 @@
 package main
 
 import (
-	"context"
+	"bufio"
+	"bytes"
+	"container/list"
+	"io"
+	"io/ioutil"
 	"log"
-	"strings"
+	"os"
+	"strconv"
 	"sync"
-	"time"
 )
 
 type traceInfo struct {
-	isTarget   bool     //是否命中上报规则,为true 表示已经命中
-	createTime int64    // 创建map key时的时间戳 time.Now().Unix()
-	sum        int      //当前traceid累计记录数量
-	cur        int      //已发送游标
-	sendData   []string //待向后端发送的数据
+	isTarget  bool     //是否命中上报规则,为true 表示已经命中
+	firstTime int64    // 第一条span的starttime
+	sum       int      //当前traceid累计记录数量
+	cur       int      //已发送游标
+	sendData  [][]byte //待向后端发送的数据
+	hasFile   bool
+	m         sync.Mutex
 }
 
 type filter struct {
-	m        sync.Mutex  //互斥锁
-	spanchan chan string //待过滤数据通道
-	//traceMap  map[string]*traceInfo //traceid数据映射表
-	traceMap  sync.Map
-	cli       *processdCli //向后端发送数据的客户端
-	doneChan  chan int     //过滤完成时关闭
-	isSending bool         // 是否在发送中
+	//traceMap  map[int64]*traceInfo //traceid数据映射表
+	traceMap       sync.Map
+	opt            *option
+	cli            *processdCli
+	curBufNum      int //当前缓冲区内的未命中traceid数量
+	lruTraceidList *list.List
 }
 
 func newFilter(opt *option) *filter {
-	return &filter{sync.Mutex{}, make(chan string, 1000), sync.Map{}, newProcessdCli("localhost:50002", opt), make(chan int), false}
+	return &filter{
+		sync.Map{},
+		opt,
+		newProcessdCli(opt),
+		0,
+		list.New()}
 }
 
 //向tracemap中添加新traceid key
-func (f *filter) addTraceidKey(traceid string) *traceInfo {
-	t := &traceInfo{false, time.Now().Unix(), 0, 0, []string{}}
-	info, _ := f.traceMap.LoadOrStore(traceid, t)
+func (f *filter) addTraceidKey(traceid []byte, firstTime int64) *traceInfo {
+	t := &traceInfo{
+		false,
+		firstTime,
+		0,
+		0,
+		[][]byte{},
+		false,
+		sync.Mutex{}}
+	key, _ := strconv.ParseUint(string(traceid), 16, 64)
+	info, _ := f.traceMap.LoadOrStore(key, t)
 	return info.(*traceInfo)
 }
 
-//从cur发送当前所有数据
-func (t *traceInfo) sendCurrentTraceData(sendchan chan string) *traceInfo {
-	for {
-		len := len(t.sendData)
-		if len > t.cur {
-			select {
-			case sendchan <- t.sendData[t.cur]:
-				t.cur++
-			case <-time.After(time.Second * 1):
-				log.Printf("wait 1 second,sendchan is blocked, can't push data in it")
+func (t *traceInfo) sendAllCurrentDataToBuf(cli *processdCli) (b bool) {
+	t.m.Lock()
+	defer t.m.Unlock()
+	b = true
+	n := len(t.sendData)
+	if n > 0 {
+		for _, v := range t.sendData {
+			if !cli.sendToBuffer(v) {
+				b = false
+				break
 			}
-		} else {
-			if t.cur > 0 {
-				t.sendData = t.sendData[t.cur:]
-				t.cur = 0
-			}
-			return t
+			t.cur++
+		}
+		if t.cur > 0 {
+			copy(t.sendData, t.sendData[t.cur:])
+			t.sendData = t.sendData[:n-t.cur]
+			t.cur = 0
 		}
 	}
+	return
 }
-func (f *filter) runSendData(ctx context.Context, sendchan chan string) {
-	f.m.Lock()
-	if f.isSending {
+
+func (f *filter) handleSpan(span []byte) {
+	fields := bytes.Split(span, []byte("|"))
+	if len(fields) < 9 {
+		log.Printf("%s", span)
 		return
-	} else {
-		f.isSending = true
-		defer func() { f.isSending = false }()
 	}
-	f.m.Unlock()
-	for {
-		f.traceMap.Range(func(traceid, info interface{}) bool {
-			if info.(*traceInfo).sum > 19999 {
-				//同个traceid数据不会超过2万行
-				return true
+	// traceId :fields[0]  tags : fields[8]
+	key, _ := strconv.ParseUint(string(fields[0]), 16, 64)
+	info, exist := f.traceMap.Load(key)
+	if !exist {
+		firstTime, _ := strconv.ParseInt(string(fields[1]), 10, 64)
+		info = f.addTraceidKey(fields[0], firstTime)
+		f.curBufNum++
+		f.lruTraceidList.PushBack(key)
+		if f.curBufNum > f.opt.bufNum {
+			for {
+				e := f.lruTraceidList.Front()
+				tmpinfo, _ := f.traceMap.Load(e.Value)
+				f.lruTraceidList.Remove(e)
+				f.curBufNum--
+				if tmpinfo.(*traceInfo).isTarget {
+					continue
+				} else {
+					//info  复用tmpinfo的缓冲区
+					if firstTime-tmpinfo.(*traceInfo).firstTime > f.opt.bufTime {
+						//直接覆盖，tmpinfo现有数据直接丢失
+						info.(*traceInfo).sendData = tmpinfo.(*traceInfo).sendData[:0]
+						tmpinfo.(*traceInfo).sendData = nil
+					} else {
+						//	tmpinfo.(*traceInfo).flushToTmpFile([]byte(fmt.Sprintf("%x", e.Value)))
+						//	tmpinfo.(*traceInfo).hasFile = true
+						info.(*traceInfo).sendData = tmpinfo.(*traceInfo).sendData[:0]
+						tmpinfo.(*traceInfo).sendData = nil
+					}
+					break
+				}
 			}
-			if info.(*traceInfo).isTarget {
-				info = info.(*traceInfo).sendCurrentTraceData(sendchan)
-				f.traceMap.Store(traceid, info)
-			}
-			return true
-		})
-		select {
-		case <-ctx.Done():
-			log.Printf("has send all  data to sendchan ")
-			close(f.doneChan)
+		}
+	}
+	info.(*traceInfo).sum++
+	// if traceid is target ,send
+	if !info.(*traceInfo).isTarget && checkIsTarget(fields[8]) {
+		info.(*traceInfo).isTarget = true
+		//traceid first target
+		go f.cli.setTargetTraceidToProcessd(fields[0])
+		if info.(*traceInfo).hasFile {
+			log.Printf("unexpact,first target but need to load from file")
+			info.(*traceInfo).loadFromFile(fields[0])
+			info.(*traceInfo).hasFile = false
+		}
+	}
+	if info.(*traceInfo).isTarget {
+		if info.(*traceInfo).sendAllCurrentDataToBuf(f.cli) && f.cli.sendToBuffer(span) {
 			return
-		default:
-			<-time.After(time.Second)
+		} else {
+			info.(*traceInfo).sendData = append(info.(*traceInfo).sendData, span)
+			log.Printf("sendChan blocked")
+		}
+	} else {
+		if info.(*traceInfo).hasFile {
+			log.Printf("unexpact ,traceid is not target ,need to write file")
+			//TODO
+		} else {
+			info.(*traceInfo).sendData = append(info.(*traceInfo).sendData, span)
 		}
 	}
 }
 
-//过滤数据
-func (f *filter) runFilterdata() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var span string
-	var fields []string
-	var traceid string
-	var exist bool
-	var info interface{}
-	go f.cli.runSendTraceData(f.doneChan)
+//load to memory
+func (t *traceInfo) loadFromFile(traceid []byte) {
+	log.Printf("loadFromFile")
+	b, err := ioutil.ReadFile("./tracedata/" + string(traceid) + ".tmp")
+	if err != nil {
+		log.Println(err)
+	}
+	buf := bytes.NewBuffer(b)
 	for {
-		select {
-		case span = <-f.spanchan:
-			if span == "EOF" {
-				return
-			}
-			fields = strings.Split(span, "|")
-			// traceId | startTime | spanId | parentSpanId | duration | serviceName | spanName | host | tags
-			traceid = fields[0]
-			info, exist = f.traceMap.Load(traceid)
-			if !exist {
-				info = f.addTraceidKey(traceid)
-			}
-			info.(*traceInfo).sendData = append(info.(*traceInfo).sendData, span)
-			info.(*traceInfo).sum++
-			// 如果该traceid数据已经被标记上报，就跳过检查
-			if info.(*traceInfo).isTarget {
-				break
-			}
-			if checkIsTarget(fields[8]) {
-				//traceid 第一次命中，开始发送数据,并通知后端traceid
-				//log.Printf("%s , first target ", traceid)
-				info.(*traceInfo).isTarget = true
-				go f.cli.setTargetTraceidToProcessd(traceid)
-				go f.runSendData(ctx, f.cli.sendchan)
-			}
-		case <-time.After(time.Second):
-			log.Printf("wait 1 second for http get data ")
+		span, err := buf.ReadBytes('\n')
+		t.sendData = append(t.sendData, span)
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			log.Println(err)
+			return
 		}
 	}
 }
-func checkIsTarget(tag string) bool {
+
+//flush to file
+func (t *traceInfo) flushToTmpFile(traceid []byte) {
+	if len(t.sendData) == 0 {
+		return
+	}
+	log.Printf("flushToTmpFile,spannum:%d", len(t.sendData))
+	file, err := os.OpenFile("./tracedata/"+string(traceid)+".tmp", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer file.Close()
+	if err != nil {
+		log.Printf("open file failed err:%v", err)
+		file = nil
+	}
+	writer := bufio.NewWriter(file)
+	for _, v := range t.sendData {
+		writer.Write(v)
+	}
+	writer.Flush()
+	t.sendData = t.sendData[:0]
+	t.cur = 0
+}
+func checkIsTarget(tag []byte) bool {
 	//判断error 等于1的调用链路
-	if strings.Contains(tag, "error=1") {
+	if bytes.Contains(tag, []byte("error=1")) {
 		return true
 	}
 	// 找到所有tags中存在 http.status_code 不为 200
-	if index := strings.Index(tag, "http.status_code="); index != -1 {
-		if tag[index+17:index+20] != "200" {
+	if index := bytes.Index(tag, []byte("http.status_code=")); index != -1 {
+		if !(tag[index+17] == 50 && tag[index+18] == 48 && tag[index+19] == 48) {
 			return true
 		}
 	}

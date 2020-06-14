@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,32 +31,50 @@ func (s *agentServer) initServer(opt *option) {
 // 被processd调用，通知agentd需要上报的traceid
 func (s *agentServer) NotifyTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
 	traceid := in.GetTraceid()
-	info := s.f.addTraceidKey(traceid)
-	info.isTarget = true
-	//go info.runSendData(traceid, s.f.cli.sendchan, s.f.doneChan)
-	return &pb.Reply{Reply: "ok"}, nil
+	info := s.f.addTraceidKey(traceid, time.Now().Unix())
+	if !info.isTarget {
+		if info.hasFile {
+			info.loadFromFile(traceid)
+			info.hasFile = false
+		}
+		info.isTarget = true
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			log.Println("NotifyTargetTraceid panic:%v", err)
+		}
+	}()
+	info.sendAllCurrentDataToBuf(s.f.cli)
+	return &pb.Reply{Reply: []byte("ok")}, nil
+}
+
+func (s *agentServer) NotifyAllFilterOver(ctx context.Context, in *pb.Req) (*pb.Reply, error) {
+	s.f.cli.endSend()
+	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
 //下载数据并过滤
 // TODO 考虑是否要分片下载
 func (s *agentServer) getData(url string) {
 	log.Printf("start get data")
+	//	ctx, cancel := context.WithCancel(context.Background())
+	//	defer cancel()
+	go s.f.cli.runStreamSendToProcessd()
 	startTime := time.Now().Unix()
 	res, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer res.Body.Close()
-	scanner := bufio.NewScanner(res.Body)
-	go s.f.runFilterdata()
-	for scanner.Scan() {
-		select {
-		case s.f.spanchan <- scanner.Text() + "\n":
-		case <-time.After(time.Second * 1):
-			log.Printf("wait 1 second , spanchan is blocked ,can't put data in it")
+	reader := bufio.NewReader(res.Body)
+	for {
+		span, err := reader.ReadBytes('\n')
+		s.f.handleSpan(span)
+		if err == io.EOF {
+			break
 		}
 	}
-	s.f.spanchan <- "EOF"
+	s.f.cli.notifyFilterOver()
 	log.Printf("finish get data, time %d s", time.Now().Unix()-startTime)
 }
 
@@ -63,7 +83,11 @@ func (s *agentServer) StartGrpcServer() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-	srv := grpc.NewServer()
+	var kasp = keepalive.ServerParameters{
+		Time:    5 * time.Second,  // Ping the client if it is idle for 5 seconds to ensure the connection is still active
+		Timeout: 10 * time.Second, // Wait 1 second for the ping ack before assuming the connection is dead
+	}
+	srv := grpc.NewServer(grpc.KeepaliveParams(kasp))
 	pb.RegisterAgentServiceServer(srv, s)
 	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)

@@ -3,6 +3,7 @@ package main
 import (
 	"alitest2020/processd/pb"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"fmt"
@@ -16,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,48 +34,83 @@ insertKeyWithOrderd 方法负责此列表的有序插入，
 type processServer struct {
 	opt *option
 	pb.UnimplementedProcessServiceServer
-	revChan      chan string
-	traceDataMap sync.Map //traceDataMap map[string]*traceDataDesc //key为 traceid
-	agentdcli    *agentdCli
-	agentPeer    []string //agentd 发送完数据会调用NotifySendOver 通知processd，将agent的addr存入agentPeer
+	revChan      chan []byte
+	traceDataMap sync.Map //traceDataMap map[int64]*traceDataDesc //key为 traceid
+	agentPeer    map[string]int
 	agentDone    chan int
 	port         string
 	ckStatus     []*checkStatus
+	agentClis    []*agentdCli
 }
 
 type checkStatus struct {
 	startTime int64
-	traceid   string
+	traceid   []byte
 }
 type traceDataDesc struct {
 	num           int              // traceid的span累计数量
 	startTimeList []int64          //startTime 有序列表, 新增时做有序插入
-	traceData     map[int64]string //key是startTime,value是一条span日志
+	traceData     map[int64][]byte //key是startTime,value是一条span日志
 }
 
 func (s *processServer) initServer(opt *option) {
 	s.opt = opt
-	s.revChan = make(chan string, 2000)
-	s.agentdcli = newAgentdCli("localhost:50000,localhost:50001")
-	s.agentPeer = []string{}
+	s.revChan = make(chan []byte, 2000)
+	s.agentPeer = make(map[string]int)
 	s.agentDone = make(chan int)
 	s.ckStatus = []*checkStatus{}
+	s.agentClis = []*agentdCli{newAgentdCli("localhost:50000"), newAgentdCli("localhost:50001")}
 }
 func (s *processServer) SetTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
 	traceid := in.GetTraceid()
-	s.agentdcli.broadcastNotifyTargetTraceid(traceid)
-	return &pb.Reply{Reply: "ok"}, nil
+	s.broadcastNotifyTargetTraceid(traceid)
+	return &pb.Reply{Reply: []byte("ok")}, nil
+}
+func (s *processServer) broadcastNotifyTargetTraceid(traceid []byte) {
+	for _, cli := range s.agentClis {
+		cli.connect()
+		client := pb.NewAgentServiceClient(cli.conn)
+		_, err := client.NotifyTargetTraceid(context.Background(), &pb.TraceidRequest{Traceid: traceid})
+		if err != nil {
+			log.Fatalf("could not greet: %v", err)
+		}
+	}
+}
+func (s *processServer) broadcastNotifyAllFilterDone() {
+	for _, cli := range s.agentClis {
+		cli.connect()
+		client := pb.NewAgentServiceClient(cli.conn)
+		_, err := client.NotifyAllFilterOver(context.Background(), &pb.Req{Req: []byte("ok")})
+		if err != nil {
+			log.Fatalf("could not greet: %v", err)
+		}
+	}
 }
 
-//s.agentPeer 为2个时说明两个agentd都发送完了
+//s.agentPeer 为2个时说明两个agentd都过滤完了
+func (s *processServer) NotifyFilterOver(ctx context.Context, in *pb.Addr) (*pb.Reply, error) {
+	addr := in.GetAddr()
+	s.agentPeer[addr] = 0
+	if len(s.agentPeer) == 2 {
+		s.broadcastNotifyAllFilterDone()
+	}
+	return &pb.Reply{Reply: []byte("ok")}, nil
+}
+
+//s.agentPeer 都为1时说明两个agentd都发送完了
 func (s *processServer) NotifySendOver(ctx context.Context, in *pb.Addr) (*pb.Reply, error) {
 	addr := in.GetAddr()
-	s.agentPeer = append(s.agentPeer, addr)
-	s.agentDone <- 1
-	if len(s.agentPeer) == 2 {
-		close(s.agentDone)
+	if s.agentPeer[addr] == 0 {
+		s.agentPeer[addr] = 1
+		num := 0
+		for _, v := range s.agentPeer {
+			num += v
+		}
+		if num == 2 {
+			close(s.agentDone)
+		}
 	}
-	return &pb.Reply{Reply: "ok"}, nil
+	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 func insertCheckStatusList(list []*checkStatus, item *checkStatus) []*checkStatus {
 	list = append(list, item)
@@ -97,11 +132,11 @@ func (s *processServer) flushDataTofile(n int, m int) {
 		len := len(desc.(*traceDataDesc).startTimeList)
 		if len > n {
 			if desc.(*traceDataDesc).num == len {
-				tkStatus := &checkStatus{desc.(*traceDataDesc).startTimeList[0], traceid.(string)}
+				tkStatus := &checkStatus{desc.(*traceDataDesc).startTimeList[0], []byte(strconv.FormatUint(traceid.(uint64), 16))}
 				s.ckStatus = insertCheckStatusList(s.ckStatus, tkStatus)
 			}
 
-			file, err := os.OpenFile("./tracedata/"+traceid.(string)+".data", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			file, err := os.OpenFile("./tracedata/"+strconv.FormatUint(traceid.(uint64), 16)+".data", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
 				log.Printf("open file failed err:%v", err)
 				file.Close()
@@ -109,7 +144,7 @@ func (s *processServer) flushDataTofile(n int, m int) {
 			}
 			writer := bufio.NewWriter(file)
 			for _, st := range desc.(*traceDataDesc).startTimeList[0 : len-m] {
-				writer.WriteString(desc.(*traceDataDesc).traceData[st])
+				writer.Write(desc.(*traceDataDesc).traceData[st])
 				delete(desc.(*traceDataDesc).traceData, st)
 			}
 			desc.(*traceDataDesc).startTimeList = desc.(*traceDataDesc).startTimeList[len-m:]
@@ -121,11 +156,42 @@ func (s *processServer) flushDataTofile(n int, m int) {
 		return true
 	})
 }
+
 func (s *processServer) checksum() {
 	json := []byte{'{'}
+	s.traceDataMap.Range(func(traceid interface{}, desc interface{}) bool {
+		json = append(json, '"')
+		json = append(json, []byte(fmt.Sprintf("%x", traceid))...)
+		json = append(json, "\":\""...)
+
+		md5hash := md5.New()
+		for _, st := range desc.(*traceDataDesc).startTimeList {
+			md5hash.Write(desc.(*traceDataDesc).traceData[st])
+		}
+		json = append(json, fmt.Sprintf("%X", md5hash.Sum(nil))...)
+		json = append(json, "\","...)
+		return true
+	})
+	json = json[:len(json)-1]
+	json = append(json, '}')
+	v := url.Values{}
+	v.Set("result", string(json[:]))
+	client := &http.Client{}
+	client.PostForm("http://localhost:"+s.port+"/api/finished", v)
+	file, _ := os.OpenFile("./tracedata/checksum.data", os.O_CREATE|os.O_WRONLY, 0644)
+	writer := bufio.NewWriter(file)
+	writer.Write(json)
+	writer.Flush()
+	file.Close()
+}
+
+/*func (s *processServer) checksum() {
+	json := []byte{'{'}
 	for _, v := range s.ckStatus {
-		json = append(json, "\""+v.traceid+"\":"...)
-		f, err := os.Open("./tracedata/" + v.traceid + ".data")
+		json = append(json, '"')
+		json = append(json, v.traceid...)
+		json = append(json, "\":"...)
+		f, err := os.Open("./tracedata/" + string(v.traceid) + ".data")
 		if err != nil {
 			fmt.Println("Open", err)
 			return
@@ -153,10 +219,11 @@ func (s *processServer) checksum() {
 	writer.Write(json)
 	writer.Flush()
 	file.Close()
-}
+}*/
+
 func (s *processServer) runSaveTraceDataToFile(ctx context.Context) {
 	for {
-		s.flushDataTofile(40, 20)
+		s.flushDataTofile(30, 20)
 		select {
 		case <-ctx.Done():
 			s.flushDataTofile(0, 0)
@@ -185,22 +252,28 @@ func insertKeyWithOrderd(keylist []int64, key int64) []int64 {
 	return keylist
 }
 func (s *processServer) runProcessData() {
+	n := 0
 	log.Printf("start runProcessData")
-	defer log.Printf("end runProcessData")
-	var span string
+	//ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		//	cancel() // cancel when we are finished consuming integers
+		log.Printf("end runProcessData,total span :%d", n)
+		s.checksum()
+	}()
+	//go s.runSaveTraceDataToFile(ctx)
+	var span []byte
 	var ok bool
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // cancel when we are finished consuming integers
-	go s.runSaveTraceDataToFile(ctx)
 	for {
 		select {
 		case span, ok = <-s.revChan:
+			n++
 			s.handleSpan(span)
 			continue
 		default:
 		}
 		select {
 		case span, ok = <-s.revChan:
+			n++
 			s.handleSpan(span)
 			continue
 		case _, ok = <-s.agentDone:
@@ -211,35 +284,40 @@ func (s *processServer) runProcessData() {
 		break
 	}
 }
-func (s *processServer) handleSpan(span string) {
-	fields := strings.SplitN(span, "|", 3) //traceid:fields[0],startTime:fields[1]
-	startTime, _ := strconv.ParseInt(fields[1], 10, 64)
-	tdDesc, ok := s.traceDataMap.Load(fields[0])
+func (s *processServer) handleSpan(span []byte) {
+	fields := bytes.SplitN(span, []byte("|"), 3) //traceid:fields[0],startTime:fields[1]
+	if len(fields) < 3 {
+		log.Printf("unexpact: %s", string(span))
+		return
+	}
+	startTime, _ := strconv.ParseInt(string(fields[1]), 10, 64)
+	key, _ := strconv.ParseUint(string(fields[0]), 16, 64)
+	tdDesc, ok := s.traceDataMap.Load(key)
 	if !ok {
-		tdDesc = &traceDataDesc{0, []int64{}, make(map[int64]string)}
+		tdDesc = &traceDataDesc{0, []int64{}, make(map[int64][]byte)}
 	}
 	startTimeKeys := tdDesc.(*traceDataDesc).startTimeList
 	//累计数据总数sum 大于 .startTimeList的数量，说明已经有数据写入文件，
 	// startTime 比第一个元素小，说明需要在文件中插入，需要额外处理
-	if tdDesc.(*traceDataDesc).num > len(startTimeKeys) && (len(startTimeKeys[:]) == 0 || startTime < startTimeKeys[0]) {
-		log.Printf("need insert to file")
-		//TODO
-		tdDesc.(*traceDataDesc).num++
-		tdDesc.(*traceDataDesc).traceData[startTime] = span
-		tdDesc.(*traceDataDesc).startTimeList = insertKeyWithOrderd(startTimeKeys, startTime)
+	/*	if tdDesc.(*traceDataDesc).num > len(startTimeKeys) && (startTime < startTimeKeys[0]) {
+			log.Printf("need insert to file")
+			//TODO
+		} else {
+			tdDesc.(*traceDataDesc).num++
+			tdDesc.(*traceDataDesc).traceData[startTime] = span
+			tdDesc.(*traceDataDesc).startTimeList = insertKeyWithOrderd(startTimeKeys, startTime)
+		}*/
+	tdDesc.(*traceDataDesc).num++
+	tdDesc.(*traceDataDesc).traceData[startTime] = span
+	tdDesc.(*traceDataDesc).startTimeList = insertKeyWithOrderd(startTimeKeys, startTime)
 
-	} else {
-		tdDesc.(*traceDataDesc).num++
-		tdDesc.(*traceDataDesc).traceData[startTime] = span
-		tdDesc.(*traceDataDesc).startTimeList = insertKeyWithOrderd(startTimeKeys, startTime)
-	}
-	s.traceDataMap.Store(fields[0], tdDesc)
+	s.traceDataMap.Store(key, tdDesc)
 }
 func (s *processServer) SendTraceData(gs pb.ProcessService_SendTraceDataServer) error {
 	for {
 		in, err := gs.Recv()
 		if err == io.EOF {
-			gs.SendAndClose(&pb.Reply{Reply: "ok"})
+			gs.SendAndClose(&pb.Reply{Reply: []byte("ok")})
 			break
 		}
 		if err != nil {

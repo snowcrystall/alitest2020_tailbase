@@ -1,36 +1,40 @@
 package main
 
 import (
-	"alitest2020/processd/pb"
-	"context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"log"
-	"strings"
 	"time"
 )
 
 type agentdCli struct {
-	addrs []string
+	conn *grpc.ClientConn
+	addr string
 }
 
 func newAgentdCli(addr string) *agentdCli {
-	return &agentdCli{strings.Split(addr, ",")}
+	return &agentdCli{nil, addr}
+}
+func (c *agentdCli) connect() {
+	if c.conn != nil {
+		return
+	}
+	// Set up a connection to the server.
+	var kacp = keepalive.ClientParameters{
+		Time:                5 * time.Second,  // send pings every 10 seconds if there is no activity
+		Timeout:             10 * time.Second, // wait 1 second for ping ack before considering the connection dead
+		PermitWithoutStream: true,             // send pings even without active streams
+	}
+	conn, err := grpc.Dial(c.addr, grpc.WithInsecure(), grpc.WithKeepaliveParams(kacp))
+	if err != nil {
+		log.Fatalf("did not connect: %s : %v ", c.addr, err)
+	}
+	c.conn = conn
 }
 
-func (c *agentdCli) broadcastNotifyTargetTraceid(traceid string) {
-	for _, addr := range c.addrs {
-		// Set up a connection to the server.
-		conn, err := grpc.Dial(addr, grpc.WithInsecure())
-		if err != nil {
-			log.Fatalf("did not connect: %s : %v ", addr, err)
-			break
-		}
-		client := pb.NewAgentServiceClient(conn)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_, err = client.NotifyTargetTraceid(ctx, &pb.TraceidRequest{Traceid: traceid})
-		if err != nil {
-			log.Fatalf("could not greet: %v", err)
-		}
+func (c *agentdCli) close() {
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
 	}
 }
