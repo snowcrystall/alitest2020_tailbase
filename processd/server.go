@@ -177,49 +177,14 @@ func (s *processServer) checksum() {
 	v := url.Values{}
 	v.Set("result", string(json[:]))
 	client := &http.Client{}
-	client.PostForm("http://localhost:"+s.port+"/api/finished", v)
+	res, err := client.PostForm("http://localhost:"+s.port+"/api/finished", v)
+	log.Println(res, err)
 	file, _ := os.OpenFile("./tracedata/checksum.data", os.O_CREATE|os.O_WRONLY, 0644)
 	writer := bufio.NewWriter(file)
 	writer.Write(json)
 	writer.Flush()
 	file.Close()
 }
-
-/*func (s *processServer) checksum() {
-	json := []byte{'{'}
-	for _, v := range s.ckStatus {
-		json = append(json, '"')
-		json = append(json, v.traceid...)
-		json = append(json, "\":"...)
-		f, err := os.Open("./tracedata/" + string(v.traceid) + ".data")
-		if err != nil {
-			fmt.Println("Open", err)
-			return
-		}
-		md5hash := md5.New()
-		if _, err := io.Copy(md5hash, f); err != nil {
-			fmt.Println("Copy", err)
-			return
-		}
-		md5 := md5hash.Sum(nil)
-		json = append(json, '"')
-		json = append(json, fmt.Sprintf("%X", md5)...)
-		json = append(json, "\","...)
-		f.Close()
-		//		fmt.Printf("%d,%s,%X,\n", v.startTime, v.traceid, md5)
-	}
-	json = json[:len(json)-1]
-	json = append(json, '}')
-	v := url.Values{}
-	v.Set("result", string(json[:]))
-	client := &http.Client{}
-	client.PostForm("http://localhost:"+s.port+"/api/finished", v)
-	file, _ := os.OpenFile("./tracedata/checksum.data", os.O_CREATE|os.O_WRONLY, 0644)
-	writer := bufio.NewWriter(file)
-	writer.Write(json)
-	writer.Flush()
-	file.Close()
-}*/
 
 func (s *processServer) runSaveTraceDataToFile(ctx context.Context) {
 	for {
@@ -238,6 +203,18 @@ func (s *processServer) runSaveTraceDataToFile(ctx context.Context) {
 }
 func insertKeyWithOrderd(keylist []int64, key int64) []int64 {
 	//key 是startTime,从过滤服务接收过来的数据大致是有序的，所以采用尾部比较插入
+	//去重
+	l := 0
+	r := len(keylist) - 1
+	for l <= r {
+		mid := (l + r) >> 1
+		if keylist[mid] == key {
+			return keylist
+			r = mid - 1
+		} else {
+			l = mid + 1
+		}
+	}
 	keylist = append(keylist, key)
 	i := len(keylist) - 1
 	for i > 0 {

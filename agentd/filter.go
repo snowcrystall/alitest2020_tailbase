@@ -3,12 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"container/list"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
-	"strconv"
 	"sync"
 )
 
@@ -24,11 +22,11 @@ type traceInfo struct {
 
 type filter struct {
 	//traceMap  map[int64]*traceInfo //traceid数据映射表
-	traceMap       sync.Map
-	opt            *option
-	cli            *processdCli
-	curBufNum      int //当前缓冲区内的未命中traceid数量
-	lruTraceidList *list.List
+	traceMap  sync.Map
+	opt       *option
+	cli       *processdCli
+	curBufNum int //当前缓冲区内的未命中traceid数量
+	m         sync.Mutex
 }
 
 func newFilter(opt *option) *filter {
@@ -37,7 +35,7 @@ func newFilter(opt *option) *filter {
 		opt,
 		newProcessdCli(opt),
 		0,
-		list.New()}
+		sync.Mutex{}}
 }
 
 //向tracemap中添加新traceid key
@@ -50,8 +48,7 @@ func (f *filter) addTraceidKey(traceid []byte, firstTime int64) *traceInfo {
 		[][]byte{},
 		false,
 		sync.Mutex{}}
-	key, _ := strconv.ParseUint(string(traceid), 16, 64)
-	info, _ := f.traceMap.LoadOrStore(key, t)
+	info, _ := f.traceMap.LoadOrStore(traceidToUint64(traceid), t)
 	return info.(*traceInfo)
 }
 
@@ -69,48 +66,38 @@ func (t *traceInfo) sendAllCurrentDataToBuf(cli *processdCli) (b bool) {
 			t.cur++
 		}
 		if t.cur > 0 {
-			copy(t.sendData, t.sendData[t.cur:])
-			t.sendData = t.sendData[:n-t.cur]
+			//		copy(t.sendData, t.sendData[t.cur:])
+			//		t.sendData = t.sendData[:n-t.cur]
+			t.sendData = t.sendData[t.cur:]
 			t.cur = 0
 		}
 	}
 	return
 }
 
-func (f *filter) handleSpan(span []byte) {
-	fields := bytes.Split(span, []byte("|"))
-	if len(fields) < 9 {
-		log.Printf("%s", span)
-		return
-	}
+func (f *filter) handleSpan(span []byte, fields [][]byte, lruTraceidList []*Queue, rangeNum int) {
 	// traceId :fields[0]  tags : fields[8]
-	key, _ := strconv.ParseUint(string(fields[0]), 16, 64)
+	key := traceidToUint64(fields[0])
 	info, exist := f.traceMap.Load(key)
 	if !exist {
-		firstTime, _ := strconv.ParseInt(string(fields[1]), 10, 64)
-		info = f.addTraceidKey(fields[0], firstTime)
+		info = f.addTraceidKey(fields[0], startTimeToInt64(fields[1]))
 		f.curBufNum++
-		f.lruTraceidList.PushBack(key)
+		lruTraceidList[rangeNum].Push(key)
 		if f.curBufNum > f.opt.bufNum {
+			useRangeNum := 0
 			for {
-				e := f.lruTraceidList.Front()
-				tmpinfo, _ := f.traceMap.Load(e.Value)
-				f.lruTraceidList.Remove(e)
+				e := lruTraceidList[useRangeNum].Pop()
+				if e == nil {
+					useRangeNum++
+					continue
+				}
 				f.curBufNum--
+				tmpinfo, _ := f.traceMap.Load(e)
 				if tmpinfo.(*traceInfo).isTarget {
 					continue
 				} else {
-					//info  复用tmpinfo的缓冲区
-					if firstTime-tmpinfo.(*traceInfo).firstTime > f.opt.bufTime {
-						//直接覆盖，tmpinfo现有数据直接丢失
-						info.(*traceInfo).sendData = tmpinfo.(*traceInfo).sendData[:0]
-						tmpinfo.(*traceInfo).sendData = nil
-					} else {
-						//	tmpinfo.(*traceInfo).flushToTmpFile([]byte(fmt.Sprintf("%x", e.Value)))
-						//	tmpinfo.(*traceInfo).hasFile = true
-						info.(*traceInfo).sendData = tmpinfo.(*traceInfo).sendData[:0]
-						tmpinfo.(*traceInfo).sendData = nil
-					}
+					info.(*traceInfo).sendData = tmpinfo.(*traceInfo).sendData[:0]
+					tmpinfo.(*traceInfo).sendData = nil
 					break
 				}
 			}
@@ -122,11 +109,11 @@ func (f *filter) handleSpan(span []byte) {
 		info.(*traceInfo).isTarget = true
 		//traceid first target
 		go f.cli.setTargetTraceidToProcessd(fields[0])
-		if info.(*traceInfo).hasFile {
+		/*if info.(*traceInfo).hasFile {
 			log.Printf("unexpact,first target but need to load from file")
 			info.(*traceInfo).loadFromFile(fields[0])
 			info.(*traceInfo).hasFile = false
-		}
+		}*/
 	}
 	if info.(*traceInfo).isTarget {
 		if info.(*traceInfo).sendAllCurrentDataToBuf(f.cli) && f.cli.sendToBuffer(span) {
@@ -136,12 +123,14 @@ func (f *filter) handleSpan(span []byte) {
 			log.Printf("sendChan blocked")
 		}
 	} else {
-		if info.(*traceInfo).hasFile {
+		/*if info.(*traceInfo).hasFile {
 			log.Printf("unexpact ,traceid is not target ,need to write file")
 			//TODO
-		} else {
+		} else {*/
+		if info.(*traceInfo).sendData != nil {
 			info.(*traceInfo).sendData = append(info.(*traceInfo).sendData, span)
 		}
+		//	}
 	}
 }
 
@@ -198,4 +187,28 @@ func checkIsTarget(tag []byte) bool {
 		}
 	}
 	return false
+}
+
+func traceidToUint64(a []byte) (u uint64) {
+	var d byte
+	for _, c := range a {
+		switch {
+		case '0' <= c && c <= '9':
+			d = c - '0'
+		case 'a' <= c && c <= 'z':
+			d = c - 'a' + 10
+		}
+		u *= uint64(16)
+		u += uint64(d)
+	}
+	return u
+}
+
+func startTimeToInt64(a []byte) (u int64) {
+	for _, c := range a {
+		u *= int64(16)
+		u += int64(c - '0')
+	}
+	return u
+
 }
