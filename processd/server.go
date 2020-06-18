@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -34,13 +35,13 @@ insertKeyWithOrderd 方法负责此列表的有序插入，
 type processServer struct {
 	opt *option
 	pb.UnimplementedProcessServiceServer
-	revChan      chan []byte
-	traceDataMap sync.Map //traceDataMap map[int64]*traceDataDesc //key为 traceid
-	agentPeer    map[string]int
-	agentDone    chan int
-	port         string
-	ckStatus     []*checkStatus
-	agentClis    []*agentdCli
+	revChan          chan []byte
+	traceDataMap     sync.Map //traceDataMap map[int64]*traceDataDesc //key为 traceid
+	agentDone        chan int
+	port             string
+	ckStatus         []*checkStatus
+	agentClis        []*agentdCli
+	agentPeerDoneNum int32
 }
 
 type checkStatus struct {
@@ -56,10 +57,10 @@ type traceDataDesc struct {
 func (s *processServer) initServer(opt *option) {
 	s.opt = opt
 	s.revChan = make(chan []byte, 2000)
-	s.agentPeer = make(map[string]int)
 	s.agentDone = make(chan int)
 	s.ckStatus = []*checkStatus{}
 	s.agentClis = []*agentdCli{newAgentdCli("localhost:50000"), newAgentdCli("localhost:50001")}
+	s.agentPeerDoneNum = 0
 }
 func (s *processServer) SetTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
 	traceid := in.GetTraceid()
@@ -89,26 +90,14 @@ func (s *processServer) broadcastNotifyAllFilterDone() {
 
 //s.agentPeer 为2个时说明两个agentd都过滤完了
 func (s *processServer) NotifyFilterOver(ctx context.Context, in *pb.Addr) (*pb.Reply, error) {
-	addr := in.GetAddr()
-	s.agentPeer[addr] = 0
-	if len(s.agentPeer) == 2 {
-		s.broadcastNotifyAllFilterDone()
-	}
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
 //s.agentPeer 都为1时说明两个agentd都发送完了
 func (s *processServer) NotifySendOver(ctx context.Context, in *pb.Addr) (*pb.Reply, error) {
-	addr := in.GetAddr()
-	if s.agentPeer[addr] == 0 {
-		s.agentPeer[addr] = 1
-		num := 0
-		for _, v := range s.agentPeer {
-			num += v
-		}
-		if num == 2 {
-			close(s.agentDone)
-		}
+	s.agentPeerDoneNum = atomic.AddInt32(&s.agentPeerDoneNum, 1)
+	if s.agentPeerDoneNum == 2 {
+		close(s.agentDone)
 	}
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }

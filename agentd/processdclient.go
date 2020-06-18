@@ -38,6 +38,16 @@ func (c *processdCli) connect() {
 	}
 	c.conn = conn
 }
+func (c *processdCli) getStream() pb.ProcessService_SendTraceDataClient {
+	c.connect()
+	client := pb.NewProcessServiceClient(c.conn)
+	stream, err := client.SendTraceData(context.Background())
+	if err != nil {
+		log.Fatalf("could not get stream: %v ", err)
+	}
+	return stream
+}
+
 func (c *processdCli) setTargetTraceidToProcessd(traceid []byte) {
 	c.connect()
 	client := pb.NewProcessServiceClient(c.conn)
@@ -46,6 +56,7 @@ func (c *processdCli) setTargetTraceidToProcessd(traceid []byte) {
 		log.Fatalf("could not greet: %v", err)
 	}
 }
+
 func (c *processdCli) notifyFilterOver() {
 	c.connect()
 	client := pb.NewProcessServiceClient(c.conn)
@@ -53,11 +64,8 @@ func (c *processdCli) notifyFilterOver() {
 	if err != nil {
 		log.Fatalf("could not greet: %v", err)
 	}
+}
 
-}
-func (c *processdCli) endSend() {
-	close(c.sendChan)
-}
 func (c *processdCli) notifySendOver() {
 	c.connect()
 	client := pb.NewProcessServiceClient(c.conn)
@@ -68,40 +76,6 @@ func (c *processdCli) notifySendOver() {
 
 }
 
-func (c *processdCli) sendToBuffer(span []byte) bool {
-	select {
-	case c.sendChan <- span:
-	default:
-		log.Printf("sendChan is block")
-		return false
-	}
-	return true
-}
-func (c *processdCli) runStreamSendToProcessd() {
-	c.connect()
-	client := pb.NewProcessServiceClient(c.conn)
-	stream, err := client.SendTraceData(context.Background())
-	if err != nil {
-		log.Printf("could not get stream: %v ", err)
-	}
-	n := 0
-	defer func() {
-		c.notifySendOver()
-		stream.CloseSend()
-		log.Printf("send over, total span :%d", n)
-	}()
-
-	for {
-		select {
-		case span, ok := <-c.sendChan:
-			if !ok {
-				return
-			}
-			n++
-			stream.Send(&pb.TraceData{Tracedata: span})
-		}
-	}
-}
 func (c *processdCli) close() {
 	if c.conn != nil {
 		c.conn.Close()

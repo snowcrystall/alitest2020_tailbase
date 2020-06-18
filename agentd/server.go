@@ -23,38 +23,26 @@ import (
 // 数据过滤代理服务agentd
 type agentServer struct {
 	opt *option //服务参数
-	f   *filter //数据过滤
 	pb.UnimplementedAgentServiceServer
-	wg sync.WaitGroup
+	wg     sync.WaitGroup
+	wgSend sync.WaitGroup
+	f      *filter
 }
 
 func (s *agentServer) initServer(opt *option) {
 	s.opt = opt
-	s.f = newFilter(opt)
+	s.f = &filter{sync.Map{}, newProcessdCli(opt)}
 }
 
 // 被processd调用，通知agentd需要上报的traceid
 func (s *agentServer) NotifyTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
 	traceid := in.GetTraceid()
-	info := s.f.addTraceidKey(traceid, time.Now().Unix())
-	if !info.isTarget {
-		if info.hasFile {
-			info.loadFromFile(traceid)
-			info.hasFile = false
-		}
-		info.isTarget = true
-	}
-	defer func() {
-		if err := recover(); err != nil {
-			log.Println("NotifyTargetTraceid panic:%v", err)
-		}
-	}()
-	info.sendAllCurrentDataToBuf(s.f.cli)
+	s.f.traceMap.LoadOrStore(bytesToInt64(traceid), true)
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
 func (s *agentServer) NotifyAllFilterOver(ctx context.Context, in *pb.Req) (*pb.Reply, error) {
-	s.f.cli.endSend()
+	log.Printf("NotifyAllFilterOver")
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
@@ -62,43 +50,43 @@ func (s *agentServer) NotifyAllFilterOver(ctx context.Context, in *pb.Req) (*pb.
 func (s *agentServer) getData(url string) {
 	startTime := time.Now().Unix()
 	log.Printf("start get data")
-	go s.f.cli.runStreamSendToProcessd()
 	req, err := http.NewRequest(http.MethodHead, url, nil)
 	if err != nil {
 		log.Fatalf("Invalid url for downloading, error: %v", err)
 	}
 	client := &http.Client{}
 	res, err := client.Do(req)
-	var i int64
 	s.wg = sync.WaitGroup{}
+	s.wgSend = sync.WaitGroup{}
 	length, _ := strconv.ParseInt(res.Header["Content-Length"][0], 10, 64)
 	each := length / int64(s.opt.fn)
-	lruTraceidList := make([]*Queue, s.opt.fn+1)
-	rangeNum := 0
-	for i < length {
-		lruTraceidList[rangeNum] = NewQueue()
+	dup := 20000 * 256
+	for i := 0; i < s.opt.fn; i++ {
 		s.wg.Add(1)
-		go s.rangeData(url, i, each, lruTraceidList, rangeNum)
-		i = i + each - 512
-		rangeNum++
+		start := int64(i) * each
+		end := start + each + int64(dup)
+		go s.runRangeData(url, start, end)
+		if end >= length {
+			break
+		}
 	}
 	s.wg.Wait()
-	s.f.cli.notifyFilterOver()
+	//s.f.cli.notifyFilterOver()
 	log.Printf("finish get data, time %d s", time.Now().Unix()-startTime)
+	s.wgSend.Wait()
+	s.f.cli.notifySendOver()
+	log.Printf("finish send  data, time %d s", time.Now().Unix()-startTime)
 	s.PrintMemUsage()
 }
 
-func (s *agentServer) rangeData(url string, start int64, each int64, lruTraceidList []*Queue, rangeNum int) bool {
-	log.Printf("start get range data,from %d , each %d", start, each)
+func (s *agentServer) runRangeData(url string, start int64, end int64) bool {
+	log.Printf("start get range data,from %d , to %d", start, end)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		log.Fatalf("Invalid url for downloading, error: %v", err)
 	}
 	client := &http.Client{}
-	var span []byte
-	strStart := strconv.FormatInt(start, 10)
-	strEnd := strconv.FormatInt(start+each, 10)
-	req.Header.Set("Range", "bytes="+strStart+"-"+strEnd)
+	req.Header.Set("Range", "bytes="+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(end, 10))
 	res, err := client.Do(req)
 	if err != nil {
 		log.Fatal(err)
@@ -106,8 +94,14 @@ func (s *agentServer) rangeData(url string, start int64, each int64, lruTraceidL
 	if res.StatusCode != http.StatusPartialContent {
 		return false
 	}
-	reader := bufio.NewReader(res.Body)
+	reader := bufio.NewReaderSize(res.Body, 1024*1024*10)
+
 	var fields [][]byte
+	var span []byte
+	r := newRangeFilter(s.opt, s.f)
+
+	s.wgSend.Add(1)
+	go r.runSendData(&s.wgSend)
 	for {
 		span, err = reader.ReadBytes('\n')
 		if err == io.EOF {
@@ -117,11 +111,15 @@ func (s *agentServer) rangeData(url string, start int64, each int64, lruTraceidL
 		if len(fields) < 9 {
 			continue
 		}
-		s.f.handleSpan(span, fields, lruTraceidList, rangeNum)
+		r.checkSpan(span, fields)
 	}
+	r.checkOver = true
+	r.sendCurCond.L.Lock()
+	r.sendCurCond.Signal()
+	r.sendCurCond.L.Unlock()
 	defer res.Body.Close()
 	defer s.wg.Done()
-	log.Printf("end get range data,from %d , each %d", start, each)
+	log.Printf("end get range data,from %d , to %d", start, end)
 	return true
 }
 
@@ -136,6 +134,20 @@ func (s *agentServer) PrintMemUsage() {
 func bToMb(b uint64) uint64 {
 	return b / 1024 / 1024
 }
+
+func bytesToInt64(a []byte) (u int64) {
+	for _, c := range a {
+		u *= int64(16)
+		switch {
+		case '0' <= c && c <= '9':
+			u += int64(c - '0')
+		case 'a' <= c && c <= 'z':
+			u += int64(c - 'a' + 10)
+		}
+	}
+	return u
+}
+
 func (s *agentServer) StartGrpcServer() {
 	lis, err := net.Listen("tcp", ":"+s.opt.grpcPort)
 	if err != nil {
