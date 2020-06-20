@@ -3,11 +3,11 @@
 if [ "$SERVER_PORT" = "8000" ];
 then
     echo "Starting the agentd port 8000"
-   /usr/local/tailtrace/agentd -fn 1 -bufn 60000  -port 8000 -rpcport 50000 -filename trace1.data 2>&1 
+   /usr/local/tailtrace/agentd   -port 8000 -rpcport 50000 -filename trace1.data 2>&1 
 elif [ "$SERVER_PORT" = "8001" ];  
 then
     echo "Starting the agentd port 8001"
-   /usr/local/tailtrace/agentd -fn 1 -bufn 60000 -port 8001 -rpcport 50001  -filename trace2.data 2>&1 
+   /usr/local/tailtrace/agentd  -port 8001 -rpcport 50001  -filename trace2.data 2>&1 
 elif  [ "$SERVER_PORT" = "8002" ];  
 then
     echo "Starting the processd port 8002"

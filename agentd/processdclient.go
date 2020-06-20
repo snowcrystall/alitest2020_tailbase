@@ -10,17 +10,16 @@ import (
 )
 
 type processdCli struct {
-	conn     *grpc.ClientConn
-	addr     string //who to connect
-	sendChan chan []byte
-	opt      *option
+	conn *grpc.ClientConn
+	addr string //who to connect
+	opt  *option
 }
 
-func newProcessdCli(opt *option) *processdCli {
-	return &processdCli{nil, opt.processdAddr, make(chan []byte, 2048), opt}
+func NewProcessdCli(opt *option) *processdCli {
+	return &processdCli{nil, opt.processdAddr, opt}
 }
 
-func (c *processdCli) connect() {
+func (c *processdCli) Connect() {
 	if c.conn != nil {
 		return
 	}
@@ -38,8 +37,8 @@ func (c *processdCli) connect() {
 	}
 	c.conn = conn
 }
-func (c *processdCli) getStream() pb.ProcessService_SendTraceDataClient {
-	c.connect()
+func (c *processdCli) GetStream() pb.ProcessService_SendTraceDataClient {
+	c.Connect()
 	client := pb.NewProcessServiceClient(c.conn)
 	stream, err := client.SendTraceData(context.Background())
 	if err != nil {
@@ -48,8 +47,8 @@ func (c *processdCli) getStream() pb.ProcessService_SendTraceDataClient {
 	return stream
 }
 
-func (c *processdCli) setTargetTraceidToProcessd(traceid []byte) {
-	c.connect()
+func (c *processdCli) SetTargetTraceidToProcessd(traceid []byte) {
+	c.Connect()
 	client := pb.NewProcessServiceClient(c.conn)
 	_, err := client.SetTargetTraceid(context.Background(), &pb.TraceidRequest{Traceid: traceid})
 	if err != nil {
@@ -57,17 +56,8 @@ func (c *processdCli) setTargetTraceidToProcessd(traceid []byte) {
 	}
 }
 
-func (c *processdCli) notifyFilterOver() {
-	c.connect()
-	client := pb.NewProcessServiceClient(c.conn)
-	_, err := client.NotifyFilterOver(context.Background(), &pb.Addr{Addr: "localhost:" + c.opt.grpcPort})
-	if err != nil {
-		log.Fatalf("could not greet: %v", err)
-	}
-}
-
-func (c *processdCli) notifySendOver() {
-	c.connect()
+func (c *processdCli) NotifySendOver() {
+	c.Connect()
 	client := pb.NewProcessServiceClient(c.conn)
 	_, err := client.NotifySendOver(context.Background(), &pb.Addr{Addr: "localhost:" + c.opt.grpcPort})
 	if err != nil {
@@ -76,7 +66,7 @@ func (c *processdCli) notifySendOver() {
 
 }
 
-func (c *processdCli) close() {
+func (c *processdCli) Close() {
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil

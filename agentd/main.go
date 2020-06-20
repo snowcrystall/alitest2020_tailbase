@@ -9,9 +9,8 @@ type option struct {
 	grpcPort     string
 	dataFilename string
 	processdAddr string
-	bufn         int
-	fn           int
-	//bufTime      int64
+	downn        int
+	sendn        int
 }
 
 func main() {
@@ -21,8 +20,8 @@ func main() {
 	flag.StringVar(&opt.dataFilename, "filename", "trace1.data", "data file name")
 	//flag.StringVar(&opt.processdAddr, "processdAddr", "localhost:50002", "")
 	opt.processdAddr = "localhost:50002"
-	flag.IntVar(&opt.bufn, "bufn", 20000, "")
-	flag.IntVar(&opt.fn, "fn", 2, "")
+	flag.IntVar(&opt.downn, "downn", 1, "")
+	flag.IntVar(&opt.sendn, "sendn", 1, "")
 	//flag.Int64Var(&opt.bufTime, "bufsec", 30, "")
 	flag.Parse()
 
