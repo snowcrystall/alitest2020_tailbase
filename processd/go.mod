@@ -1,4 +1,4 @@
-module alitest2020/processd
+module alitest2020_tailbase/processd
 
 go 1.13
 

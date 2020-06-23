@@ -1,7 +1,7 @@
 package main
 
 import (
-	"alitest2020/agentd/pb"
+	"alitest2020_tailbase/agentd/pb"
 	"context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"

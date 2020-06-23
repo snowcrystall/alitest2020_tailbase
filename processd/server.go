@@ -1,7 +1,7 @@
 package main
 
 import (
-	"alitest2020/processd/pb"
+	"alitest2020_tailbase/processd/pb"
 	"bufio"
 	"bytes"
 	"context"
