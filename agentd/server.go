@@ -28,72 +28,65 @@ type agentServer struct {
 	wgCheck sync.WaitGroup // wait for check data gorutines complete, which targeted datas
 	wgSend  sync.WaitGroup // wait for send data gorutines complete, which send targeted datas to processd
 
-	buf            []byte       // data buffer
-	sendCur        int64        // the position where data are sending
-	checkCur       int64        // the position where data are checking
-	checkEndChan   chan int64   //use for tell send gorutines where data has been checked
-	checkOffset    chan int64   //use for tell check gorutines where data can be start checking
-	sendOffsetChan chan int64   //use for tell download gorutines which is waiting for sendCur to goon download
-	traceMap       sync.Map     //target data map
-	cli            *processdCli //processd cli
-	sendNum        int64        //total send num
+	buf            []byte              // data buffer
+	resChan        chan *http.Response // http.Response
+	sendCur        int64               // the position where data are sending
+	checkCur       int64               // the position where data are checking
+	checkEndChan   chan int64          //use for tell send gorutines where data has been checked
+	checkEnd       bool                // if check gotutines finished
+	checkOffset    chan [2]int64       //use for tell check gorutines where data can be start checking
+	sendOffsetChan chan int64          //use for tell download gorutines which is waiting for sendCur to goon download
+	traceMap       sync.Map            //target data map
+	traceBitmap    [16]uint16          //target data bitmap
+	cli            *processdCli        //processd cli
+	sendNum        int64               //total send num
+	c              *sync.Cond          //used for check gorutine to signal send gorutine
 
 	pb.UnimplementedAgentServiceServer //pb grpc
 }
 
 const (
-	BUFSIZE        = 2048 * 1024 * 1024 // data buf size
+	/*BUFSIZE        = 2048 * 1024 * 1024 // data buf size
 	EACH_DOWNLOAD  = 500 * 1024 * 1024  //each download data size
 	CHECK_DISTANCE = 20 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
 	SEND_DISTANCE  = 300 * 1024 * 1024  //every check SEND_DISTANCE data,it will be send
-	/*BUFSIZE        = 150 * 1024 * 1024 // data buf size
+	*/
+	BUFSIZE        = 200 * 1024 * 1024 // data buf size
 	EACH_DOWNLOAD  = 50 * 1024 * 1024  //each download data size
 	CHECK_DISTANCE = 5 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
-	SEND_DISTANCE  = 30 * 1024 * 1024  //every check SEND_DISTANCE data,it will be send
-	*/
+	SEND_DISTANCE  = 80 * 1024 * 1024  //every check SEND_DISTANCE data,it will be send
+
 )
 
 func (s *agentServer) initServer(opt *option) {
 	s.opt = opt
-	s.buf = make([]byte, BUFSIZE)
+	s.buf = make([]byte, BUFSIZE, BUFSIZE)
 	s.sendCur = 0
 	s.checkCur = 0
 	s.checkEndChan = make(chan int64, 50)
-	s.checkOffset = make(chan int64, 50)
+	s.resChan = make(chan *http.Response, 10)
+	s.checkOffset = make(chan [2]int64, 50)
 	s.sendOffsetChan = make(chan int64, 50)
 	s.traceMap = sync.Map{}
 	s.cli = NewProcessdCli(s.opt)
+	s.wg = sync.WaitGroup{}
+	s.wgCheck = sync.WaitGroup{}
+	s.wgSend = sync.WaitGroup{}
+	s.c = sync.NewCond(&sync.Mutex{})
+	s.checkEnd = false
 }
 
 // 被processd调用，通知agentd需要上报的traceid
 func (s *agentServer) NotifyTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
 	traceid := in.GetTraceid()
-	s.traceMap.LoadOrStore(bytesToInt64(traceid), true)
+	s.SetTraceIdTarget(bytesToInt64(traceid))
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
 //下载数据并过滤
 func (s *agentServer) GetData(url string) {
 	startTime := time.Now().UnixNano()
-	s.wg = sync.WaitGroup{}
-	s.wgCheck = sync.WaitGroup{}
 	var start int64 = 0
-	resChan := make(chan *http.Response, 10)
-	for i := 0; i < s.opt.downn; i++ {
-		s.wg.Add(1)
-		go s.ReadRangeData(resChan, i)
-		break
-	}
-	for i := 0; i < s.opt.sendn; i++ {
-		s.wgSend.Add(1)
-		go s.SendRangeData()
-		break
-	}
-	for i := 0; i < s.opt.sendn*2; i++ {
-		s.wgCheck.Add(1)
-		go s.CheckTargetData()
-		break
-	}
 
 	for {
 		req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -106,19 +99,27 @@ func (s *agentServer) GetData(url string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if res.StatusCode != http.StatusPartialContent {
-			close(resChan)
+		start += res.ContentLength - 300
+		s.resChan <- res
+		if res.ContentLength < EACH_DOWNLOAD {
+			close(s.resChan)
 			break
 		}
-		start += res.ContentLength
-		resChan <- res
 	}
 	s.wg.Wait()
 	close(s.checkOffset)
 	log.Printf("finish download data, time %d ms", (time.Now().UnixNano()-startTime)/1000000)
 	s.wgCheck.Wait()
 	close(s.checkEndChan)
+	s.c.L.Lock()
 	log.Printf("finish check data, time %d ms, %d", (time.Now().UnixNano()-startTime)/1000000, s.checkCur)
+	s.checkEnd = true
+	s.c.Signal()
+	s.c.L.Unlock()
+	go func() {
+		for range s.sendOffsetChan {
+		}
+	}()
 	s.wgSend.Wait()
 	s.cli.NotifySendOver()
 	s.cli.Close()
@@ -126,19 +127,17 @@ func (s *agentServer) GetData(url string) {
 	s.PrintMemUsage()
 }
 
-func (s *agentServer) ReadRangeData(resChan chan *http.Response, who int) {
+func (s *agentServer) ReadRangeData() {
 	defer s.wg.Done()
 	for {
-		res, ok := <-resChan
+		res, ok := <-s.resChan
 		if !ok {
 			break
 		}
-		//reader := bufio.NewReader(res.Body)
-		//reader := bufio.NewReaderSize(res.Body, 1024*1024)
 		startistr := strings.TrimLeft(strings.Split(res.Header["Content-Range"][0], "-")[0], "bytes ")
 		starti, _ := strconv.ParseInt(startistr, 10, 64)
-		var sum, offset int64 = 0, 0
-		var n, m int = 0, 0
+		var sum, offset, offsetm, offsetmLast, m int64 = 0, 0, starti, 0, 0
+		var n int = 0
 		var err error
 		reader := bufio.NewReaderSize(res.Body, 1048576)
 		for {
@@ -146,27 +145,35 @@ func (s *agentServer) ReadRangeData(resChan chan *http.Response, who int) {
 			if offset >= BUFSIZE {
 				offset = offset % BUFSIZE
 			}
+
 			n, err = reader.Read(s.buf[offset:])
 			sum = sum + int64(n)
-			m += n
-			if m > CHECK_DISTANCE {
-				ii := bytes.LastIndex(s.GetRangeBufFromAbsoluteOffset(starti, starti+sum), []byte{'\n'})
-				s.checkOffset <- starti + int64(ii) + 1
-				if starti+sum+CHECK_DISTANCE >= BUFSIZE && s.sendCur < BUFSIZE {
-					for s.sendCur%BUFSIZE <= (starti+sum+CHECK_DISTANCE)%BUFSIZE {
-						log.Printf("ReadRangeData waiting for sendCur")
+			m += int64(n)
+			if m > CHECK_DISTANCE || err == io.EOF {
+				ii := bytes.LastIndex(s.GetRangeBufFromAbsoluteOffset(offsetm, offsetm+m), []byte{'\n'})
+				if starti == 0 && offsetmLast == 0 {
+					offsetmLast = -1
+				} else if offsetmLast == 0 {
+					offsetmLast = offsetm + int64(bytes.Index(s.GetRangeBufFromAbsoluteOffset(starti, 300), []byte{'\n'}))
+				}
+				s.checkOffset <- [2]int64{offsetmLast + 1, offsetm + int64(ii) + 1}
+				offsetmLast = int64(ii) + offsetm
+				if (offsetm+m+CHECK_DISTANCE*2)/BUFSIZE > s.sendCur/BUFSIZE {
+					for s.sendCur%BUFSIZE <= (offsetm+m+CHECK_DISTANCE*2)%BUFSIZE {
+						log.Printf("ReadRangeData waiting for sendCur,%d", offsetm+m+CHECK_DISTANCE*2)
 						<-s.sendOffsetChan
 					}
 				}
 
+				offsetm = offsetm + m
+				m = 0
 			}
-			//log.Printf("reader num ,%d", n)
 			if err == io.EOF {
+				res.Body.Close()
+				//log.Printf("read range data,from %d , to %d", starti, starti+sum)
 				break
 			}
 		}
-		res.Body.Close()
-		//log.Printf("read range data,from %d , to %d", starti, starti+sum)
 	}
 }
 
@@ -191,57 +198,59 @@ func (s *agentServer) GetRangeBufFromAbsoluteOffset(start, end int64) []byte {
 func (s *agentServer) CheckTargetData() {
 	//offset, end maybe larger than BUFSIZE
 	defer s.wgCheck.Done()
-	var offset int64
-	var ok bool
-	var err error
 	for {
-		offset, ok = <-s.checkOffset
+		offset, ok := <-s.checkOffset
 		if !ok {
 			break
 		}
-		bs := s.GetRangeBufFromAbsoluteOffset(s.checkCur, offset)
+		bs := s.GetRangeBufFromAbsoluteOffset(offset[0], offset[1])
 		buffer := NewBuffer(bs)
-		span := []byte{}
-		var tagi, traceIdIndex int
-		var traceId int64
-		//log.Printf("%s", s.buf)
 		for {
-			span, err = buffer.ReadSlice([]byte{'\n'})
+			span, err := buffer.ReadSlice([]byte{'\n'})
 			if err == io.EOF {
 				break
 			}
-			tagi = bytes.LastIndex(span, []byte{'|'})
-			traceIdIndex = bytes.Index(span, []byte{'|'})
-			traceId = bytesToInt64(span[:traceIdIndex])
+			tagi := bytes.LastIndex(span, []byte{'|'})
+			traceIdIndex := bytes.Index(span, []byte{'|'})
+			if traceIdIndex == -1 {
+				log.Printf("%s,%d,%d", span, offset[0], offset[1])
+			}
+			traceId := bytesToInt64(span[:traceIdIndex])
 			if checkIsTarget(span[tagi:]) {
-				//log.Printf("%s  ,  %s  ,   %x ", span[tagi:], span[:traceIdIndex], traceId)
 				s.traceMap.LoadOrStore(traceId, true)
+				//s.SetTraceIdTarget(traceId)
 				s.cli.SetTargetTraceidToProcessd(span[:traceIdIndex])
 			}
 		}
-		//log.Printf("CheckTargetData from %d ,to %d ", lastOffset, offset)
-		s.checkCur = offset
-		if s.checkCur-s.sendCur > SEND_DISTANCE {
-			s.checkEndChan <- offset
+		if s.checkCur < offset[1] {
+			s.checkCur = offset[1]
 		}
+		//	log.Printf("CheckTargetData from %d ,to %d ,checkCur %d", offset[0], offset[1], s.checkCur)
+		s.checkEndChan <- s.checkCur
+		s.c.L.Lock()
+		if s.checkCur-s.sendCur > SEND_DISTANCE {
+			s.c.Signal()
+		}
+		s.c.L.Unlock()
 	}
-	s.checkEndChan <- s.checkCur
 }
 
 func (s *agentServer) SendRangeData() {
 	defer s.wgSend.Done()
 	cli := NewProcessdCli(s.opt)
 	stream := cli.GetStream()
-	var ok bool
 	for {
 		offset, chanOk := <-s.checkEndChan
 		if !chanOk {
-			log.Printf("get checkEndChan close, %d ", offset)
 			break
 		}
+		s.c.L.Lock()
+		if !s.checkEnd && s.checkCur-s.sendCur < SEND_DISTANCE {
+			s.c.Wait()
+		}
+		s.c.L.Unlock()
 		//log.Printf("SendRangeData from %d, to %d  ", s.sendCur, offset)
 		bs := s.GetRangeBufFromAbsoluteOffset(s.sendCur, offset)
-		s.sendCur = offset
 		//log.Printf("%s", s.buf)
 		buffer := NewBuffer(bs)
 		span := []byte{}
@@ -254,14 +263,17 @@ func (s *agentServer) SendRangeData() {
 				break
 			}
 			traceIdIndex = bytes.Index(span, []byte{'|'})
+			if traceIdIndex == -1 {
+				log.Printf("%s,%d", span, s.sendCur+int64(buffer.off))
+			}
 			traceId = bytesToInt64(span[:traceIdIndex])
-			_, ok = s.traceMap.Load(traceId)
+			_, ok := s.traceMap.Load(traceId)
 			if ok {
-				//log.Printf("%s", span)
 				stream.Send(&pb.TraceData{Tracedata: span})
 				s.sendNum++
 			}
 		}
+		s.sendCur = offset
 		s.sendOffsetChan <- s.sendCur
 	}
 	_, err := stream.CloseAndRecv()
@@ -283,6 +295,21 @@ func checkIsTarget(tag []byte) bool {
 		}
 	}
 	return false
+}
+
+func (s *agentServer) SetTraceIdTarget(traceId int64) {
+	for i, _ := range s.traceBitmap {
+		s.traceBitmap[i] |= 1 << ((traceId >> (i * 4)) & 15)
+	}
+}
+
+func (s *agentServer) IsTraceIdTarget(traceId int64) bool {
+	for i, c := range s.traceBitmap {
+		if (c>>((traceId>>(i*4))&15))&1 == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *agentServer) PrintMemUsage() {
@@ -325,8 +352,25 @@ func (s *agentServer) StartGrpcServer() {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
+
 func (s *agentServer) StartHttpServer() {
-	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {})
+	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < s.opt.downn; i++ {
+			s.wg.Add(1)
+			go s.ReadRangeData()
+		}
+		for i := 0; i < s.opt.sendn; i++ {
+			s.wgSend.Add(1)
+			go s.SendRangeData()
+			break
+		}
+		for i := 0; i < s.opt.downn*5; i++ {
+			s.wgCheck.Add(1)
+			go s.CheckTargetData()
+			break
+		}
+
+	})
 	http.HandleFunc("/setParameter", func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		port := r.Form.Get("port")
@@ -338,6 +382,7 @@ func (s *agentServer) StartHttpServer() {
 	log.Fatal(http.ListenAndServe(":"+s.opt.port, nil))
 
 }
+
 func (s *agentServer) SignalHandle() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM,
