@@ -5,7 +5,6 @@ import (
 	"context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
-	"log"
 	"time"
 )
 
@@ -33,7 +32,7 @@ func (c *processdCli) Connect() {
 		c.addr, grpc.WithInsecure(),
 		grpc.WithKeepaliveParams(kacp))
 	if err != nil {
-		log.Fatalf("did not connect: %s : %v ", c.addr, err)
+		panic(err)
 	}
 	c.conn = conn
 }
@@ -42,7 +41,7 @@ func (c *processdCli) GetStream() pb.ProcessService_SendTraceDataClient {
 	client := pb.NewProcessServiceClient(c.conn)
 	stream, err := client.SendTraceData(context.Background())
 	if err != nil {
-		log.Fatalf("could not get stream: %v ", err)
+		panic(err)
 	}
 	return stream
 }
@@ -52,7 +51,7 @@ func (c *processdCli) SetTargetTraceidToProcessd(traceid []byte) {
 	client := pb.NewProcessServiceClient(c.conn)
 	_, err := client.SetTargetTraceid(context.Background(), &pb.TraceidRequest{Traceid: traceid})
 	if err != nil {
-		log.Fatalf("could not greet: %v", err)
+		panic(err)
 	}
 }
 
@@ -61,7 +60,7 @@ func (c *processdCli) NotifySendOver() {
 	client := pb.NewProcessServiceClient(c.conn)
 	_, err := client.NotifySendOver(context.Background(), &pb.Addr{Addr: "localhost:" + c.opt.grpcPort})
 	if err != nil {
-		log.Fatalf("could not greet: %v", err)
+		panic(err)
 	}
 
 }
