@@ -51,11 +51,11 @@ const (
 	CHECK_DISTANCE = 64 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
 	SEND_DISTANCE  = 1536 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
 
-/*	BUFSIZE        = 200 * 1024 * 1024 // data buf size
+	/*BUFSIZE        = 200 * 1024 * 1024 // data buf size
 	EACH_DOWNLOAD  = 50 * 1024 * 1024  //each download data size
 	CHECK_DISTANCE = 10 * 1024 * 1024  // every download CHECK_DISTANCE data ,it will be check
 	SEND_DISTANCE  = 100 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
-*/
+	*/
 )
 
 func (s *agentServer) initServer(opt *option) {
@@ -195,19 +195,12 @@ func (s *agentServer) dealres(res *http.Response) {
 		absolOffset += int64(n)
 		if absolOffset-offsetmLast >= CHECK_DISTANCE || err == io.EOF {
 			ii := absolOffset - 400 + int64(bytes.LastIndexByte(s.GetRangeBufFromAbsoluteOffset(absolOffset-400, absolOffset), '\n'))
-			if ii == -1 {
-				log.Printf("unexpact: read not find line ii==-1")
-			}
 			if starti == 0 && offsetmLast == 0 {
 				offsetmLast = -1
 			} else if offsetmLast == 0 {
 				offsetmLast = starti + int64(bytes.IndexByte(s.GetRangeBufFromAbsoluteOffset(starti, starti+400), '\n'))
-				if offsetmLast == -1 {
-					log.Printf("unexpact: read not find line offsetmLast==-1")
-				}
 			}
 			s.checkChan <- [2]int64{offsetmLast + 1, ii + 1}
-			//log.Printf("put int checkChan %d,%d", offsetmLast+1, ii+1)
 			offsetmLast = ii
 
 		}
@@ -220,9 +213,6 @@ func (s *agentServer) dealres(res *http.Response) {
 	}
 }
 func (s *agentServer) GetRangeBufFromAbsoluteOffset(start, end int64) []byte {
-	if start < 0 {
-		start = 0
-	}
 	if start >= BUFSIZE {
 		start = start % BUFSIZE
 	}
@@ -274,7 +264,7 @@ func (s *agentServer) CheckTargetData() {
 			s.checkEndChan <- o
 			if s.sendOffset.Waiting > 0 {
 				s.sendSignal.L.Lock()
-				s.sendSignal.Signal()
+				s.sendSignal.Broadcast()
 				s.sendSignal.L.Unlock()
 			}
 		}
@@ -316,7 +306,7 @@ func (s *agentServer) SendRangeData() {
 		s.sendOffset.SlideCur(offset, false)
 		if s.readWaiting > 0 {
 			s.readSignal.L.Lock()
-			s.readSignal.Signal()
+			s.readSignal.Broadcast()
 			s.readSignal.L.Unlock()
 		}
 	}

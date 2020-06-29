@@ -5,11 +5,10 @@
 *.so
 *.dylib
 *.swp
-*agentd
-*processd
+*.bak
+*.ppof
 
 # Test binary, built with `go test -c`
-*.test
 */tracedata
 *design.md
 

@@ -43,6 +43,25 @@ func (b *Buffer) ReadLineWithTraceId() (line []byte, traceId []byte, err error) 
 	return line, traceId, nil
 }
 
+/*func (b *Buffer) ReadLineWithCheck() (line []byte, traceId []byte, isTarget bool, err error) {
+	i := bytes.IndexByte(b.buf[b.off:], '|')
+	if i < 0 {
+		err = io.EOF
+		return line, traceId, err
+	}
+
+	end := b.off + i
+	traceId = b.buf[b.off:end]
+
+	i = bytes.IndexByte(b.buf[end+1:], '|')
+	end = end + 1 + i
+
+	i = bytes.IndexByte(b.buf[end:], '\n')
+	line = b.buf[b.off : end+i+1]
+	b.off = end + i + 1
+	return line, traceId, nil
+}
+*/
 /*func (b *Buffer) CheckIsTarget(d []byte) bool {
 	i:=len(d)-1
 
