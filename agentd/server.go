@@ -376,14 +376,6 @@ func (s *agentServer) StartHttpServer() {
 			s.wg.Add(1)
 			go s.ReadRangeData()
 		}
-		for i := 0; i < s.opt.sendn*2; i++ {
-			s.wgSend.Add(1)
-			go s.SendRangeData()
-		}
-		for i := 0; i < s.opt.downn*2; i++ {
-			s.wgCheck.Add(1)
-			go s.CheckTargetData()
-		}
 
 	})
 	http.HandleFunc("/setParameter", func(w http.ResponseWriter, r *http.Request) {
@@ -397,6 +389,14 @@ func (s *agentServer) StartHttpServer() {
 			}
 			s.isRunning = true
 			s.lock.Unlock()
+			for i := 0; i < s.opt.sendn*2; i++ {
+				s.wgSend.Add(1)
+				go s.SendRangeData()
+			}
+			for i := 0; i < s.opt.downn*2; i++ {
+				s.wgCheck.Add(1)
+				go s.CheckTargetData()
+			}
 
 			url := "http://localhost:" + port + "/" + s.opt.dataFilename
 			go s.GetData(url)
