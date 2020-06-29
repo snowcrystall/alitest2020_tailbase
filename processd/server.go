@@ -1,7 +1,7 @@
 package main
 
 import (
-	"alitest2020_tailbase/processd/pb"
+	"alitest2020_tailbase/pb"
 	"bufio"
 	"bytes"
 	"context"
@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"io"
 	"log"
 	"net"
@@ -23,24 +24,18 @@ import (
 	"time"
 )
 
-/**
-startTimeList 维持一个startTime 为元素值的有序列表，
-到达一定长度N之后，取出前面M个元素，
-N>M,将M的元素对应的span记录追加写到磁盘
-insertKeyWithOrderd 方法负责此列表的有序插入，
-如果待插入值小于列表里第一个元素，
-说明这个待插数据应该从磁盘文件插入，
-额外处理,当前实现是避免额外处理
-*/
 type processServer struct {
 	opt *option
 	pb.UnimplementedProcessServiceServer
-	revChan          chan []byte
-	traceDataMap     sync.Map //traceDataMap map[int64]*traceDataDesc //key为 traceid
+
+	revChan      chan []byte //trace data chan
+	traceDataMap sync.Map    //traceDataMap map[int64]*traceDataDesc //key为 traceid
+
 	agentDone        chan int
 	port             string
 	ckStatus         []*checkStatus
 	agentClis        []*agentdCli
+	agentAddrs       []string
 	agentPeerDoneNum int32
 }
 
@@ -59,31 +54,18 @@ func (s *processServer) initServer(opt *option) {
 	s.revChan = make(chan []byte, 2000)
 	s.agentDone = make(chan int)
 	s.ckStatus = []*checkStatus{}
-	s.agentClis = []*agentdCli{newAgentdCli("localhost:50000"), newAgentdCli("localhost:50001")}
+	s.agentClis = []*agentdCli{NewAgentdCli("localhost:50000"), NewAgentdCli("localhost:50001")}
+	s.agentAddrs = []string{"localhost:50000", "localhost:50001"}
 	s.agentPeerDoneNum = 0
 }
-func (s *processServer) SetTargetTraceid(ctx context.Context, in *pb.TraceidRequest) (*pb.Reply, error) {
-	traceid := in.GetTraceid()
-	s.broadcastNotifyTargetTraceid(traceid)
-	return &pb.Reply{Reply: []byte("ok")}, nil
-}
-func (s *processServer) broadcastNotifyTargetTraceid(traceid []byte) {
-	for _, cli := range s.agentClis {
-		cli.connect()
-		client := pb.NewAgentServiceClient(cli.conn)
-		_, err := client.NotifyTargetTraceid(context.Background(), &pb.TraceidRequest{Traceid: traceid})
-		if err != nil {
-			log.Fatalf("could not greet: %v", err)
-		}
-	}
-}
+
 func (s *processServer) broadcastNotifyAllFilterDone() {
 	for _, cli := range s.agentClis {
-		cli.connect()
+		cli.Connect()
 		client := pb.NewAgentServiceClient(cli.conn)
 		_, err := client.NotifyAllFilterOver(context.Background(), &pb.Req{Req: []byte("ok")})
 		if err != nil {
-			log.Fatalf("could not greet: %v", err)
+			log.Printf("could not greet: %v", err)
 		}
 	}
 }
@@ -225,6 +207,7 @@ func (s *processServer) runProcessData() {
 		//	cancel() // cancel when we are finished consuming integers
 		log.Printf("end runProcessData,total span :%d", n)
 		s.checksum()
+		s.flushDataTofile(0, 0)
 	}()
 	//go s.runSaveTraceDataToFile(ctx)
 	var span []byte
@@ -279,6 +262,7 @@ func (s *processServer) handleSpan(span []byte) {
 
 	s.traceDataMap.Store(key, tdDesc)
 }
+
 func (s *processServer) SendTraceData(gs pb.ProcessService_SendTraceDataServer) error {
 	for {
 		in, err := gs.Recv()
@@ -295,6 +279,35 @@ func (s *processServer) SendTraceData(gs pb.ProcessService_SendTraceDataServer) 
 
 	return nil
 }
+
+func (s *processServer) SendTargetIds(gs pb.ProcessService_SendTargetIdsServer) error {
+	var nodifyAddr string
+	if md, ok := metadata.FromIncomingContext(gs.Context()); ok {
+		for _, v := range s.agentAddrs {
+			if v != md["addr"][0] {
+				nodifyAddr = v
+				break
+			}
+		}
+	}
+	nodifyAgentCli := NewAgentdCli(nodifyAddr)
+	go nodifyAgentCli.RunNodifyTraceId()
+	for {
+		in, err := gs.Recv()
+		if err == io.EOF {
+			gs.SendAndClose(&pb.Reply{Reply: []byte("ok")})
+			break
+		}
+		if err != nil {
+			log.Printf("failed to recv: %v", err)
+			//	break
+		}
+		nodifyAgentCli.NodifyTraceIdChan <- [2]int64{in.Traceid, in.Checkcur}
+	}
+	nodifyAgentCli.Close()
+	return nil
+}
+
 func (s *processServer) StartGrpcServer() {
 	lis, err := net.Listen("tcp", ":"+s.opt.grpcPort)
 	if err != nil {

@@ -4,17 +4,22 @@ package pb;
 
 option go_package = "/pb";
 service AgentService {
-    rpc NotifyTargetTraceid(TraceidRequest) returns (Reply) {}
+    rpc NotifyTargetTraceids(stream TargetInfo) returns (Reply) {}
     rpc NotifyAllFilterOver(Req) returns(Reply){}
 }
 service ProcessService {
     rpc SetTargetTraceid(TraceidRequest) returns (Reply) {}
     rpc SendTraceData(stream TraceData) returns (Reply) {}
+    rpc SendTargetIds(stream TargetInfo) returns (Reply) {}
     rpc NotifyFilterOver(Addr) returns(Reply){}
     rpc NotifySendOver(Addr) returns(Reply){}
 }
 message TraceData {
    bytes tracedata = 1;
+}
+message TargetInfo {
+    int64 traceid = 1;
+    int64 checkcur =2;
 }
 message Reply {
     bytes reply = 1;

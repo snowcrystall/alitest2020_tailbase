@@ -1,21 +1,26 @@
 package main
 
 import (
+	"alitest2020_tailbase/pb"
+	"context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"log"
+	"sync"
 	"time"
 )
 
 type agentdCli struct {
-	conn *grpc.ClientConn
-	addr string
+	conn              *grpc.ClientConn
+	addr              string
+	NodifyTraceIdChan chan [2]int64
+	wg                *sync.WaitGroup
 }
 
-func newAgentdCli(addr string) *agentdCli {
-	return &agentdCli{nil, addr}
+func NewAgentdCli(addr string) *agentdCli {
+	return &agentdCli{nil, addr, make(chan [2]int64, 500), &sync.WaitGroup{}}
 }
-func (c *agentdCli) connect() {
+func (c *agentdCli) Connect() {
 	if c.conn != nil {
 		return
 	}
@@ -32,7 +37,33 @@ func (c *agentdCli) connect() {
 	c.conn = conn
 }
 
-func (c *agentdCli) close() {
+func (c *agentdCli) RunNodifyTraceId() {
+	c.wg.Add(1)
+	defer c.wg.Done()
+	c.Connect()
+	client := pb.NewAgentServiceClient(c.conn)
+	stream, err := client.NotifyTargetTraceids(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	for {
+		traceIdInfo, ok := <-c.NodifyTraceIdChan
+		if !ok {
+			break
+		}
+		stream.Send(&pb.TargetInfo{Traceid: traceIdInfo[0], Checkcur: traceIdInfo[1]})
+	}
+	_, err = stream.CloseAndRecv()
+	if err != nil {
+		log.Panicf("%v.CloseAndRecv() got error %v, want %v", stream, err, nil)
+	}
+
+}
+
+func (c *agentdCli) Close() {
+	close(c.NodifyTraceIdChan)
+	c.wg.Wait()
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil

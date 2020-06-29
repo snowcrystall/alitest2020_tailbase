@@ -1,10 +1,13 @@
 package main
 
 import (
-	"alitest2020_tailbase/agentd/pb"
+	"alitest2020_tailbase/pb"
 	"context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"log"
+	"sync"
 	"time"
 )
 
@@ -12,10 +15,19 @@ type processdCli struct {
 	conn *grpc.ClientConn
 	addr string //who to connect
 	opt  *option
+
+	SendTargetTraceIdChan chan int64
+	wg                    sync.WaitGroup
 }
 
 func NewProcessdCli(opt *option) *processdCli {
-	return &processdCli{nil, opt.processdAddr, opt}
+	p := &processdCli{}
+	p.conn = nil
+	p.addr = opt.processdAddr
+	p.opt = opt
+	p.SendTargetTraceIdChan = make(chan int64, 500)
+	p.wg = sync.WaitGroup{}
+	return p
 }
 
 func (c *processdCli) Connect() {
@@ -28,15 +40,24 @@ func (c *processdCli) Connect() {
 		Timeout:             10 * time.Second,
 		PermitWithoutStream: true,
 	}
-	conn, err := grpc.Dial(
-		c.addr, grpc.WithInsecure(),
-		grpc.WithKeepaliveParams(kacp))
-	if err != nil {
-		panic(err)
+
+	retry := 10
+	for {
+		conn, err := grpc.Dial(
+			c.addr, grpc.WithInsecure(),
+			grpc.WithKeepaliveParams(kacp))
+		if err != nil {
+			log.Printf(err.Error())
+			if retry < 0 {
+				panic(err)
+			}
+			retry--
+		}
+		c.conn = conn
+		break
 	}
-	c.conn = conn
 }
-func (c *processdCli) GetStream() pb.ProcessService_SendTraceDataClient {
+func (c *processdCli) GetSendDataStream() pb.ProcessService_SendTraceDataClient {
 	c.Connect()
 	client := pb.NewProcessServiceClient(c.conn)
 	stream, err := client.SendTraceData(context.Background())
@@ -44,6 +65,30 @@ func (c *processdCli) GetStream() pb.ProcessService_SendTraceDataClient {
 		panic(err)
 	}
 	return stream
+}
+
+func (c *processdCli) GetSendTargetIdStream() pb.ProcessService_SendTargetIdsClient {
+	c.Connect()
+	client := pb.NewProcessServiceClient(c.conn)
+	//ctx := peer.NewContext(context.Background(), &peer.Peer{"localhost:" + c.opt.grpcPort, nil})
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.MD{"addr": []string{"localhost:" + c.opt.grpcPort}})
+	stream, err := client.SendTargetIds(ctx)
+	if err != nil {
+		panic(err)
+	}
+	return stream
+}
+
+func (c *processdCli) SendTargetTraceId() {
+	/*c.wg.Add(1)
+	defer c.wg.Done()
+	for {
+		traceId, ok := <-c.SendTargetTraceIdChan
+		if !ok {
+			break
+		}
+		c.SetTargetTraceidToProcessd(traceId)
+	}*/
 }
 
 func (c *processdCli) SetTargetTraceidToProcessd(traceid []byte) {
