@@ -58,7 +58,8 @@ const (
 
 )
 
-func (s *agentServer) initServer(opt *option) {
+func NewAgentServer(opt *option) (s *agentServer) {
+	s = &agentServer{}
 	s.opt = opt
 	s.buf = make([]byte, BUFSIZE, BUFSIZE)
 	s.sendOffset = NewOffset()
@@ -76,6 +77,7 @@ func (s *agentServer) initServer(opt *option) {
 	s.sendSignal = sync.NewCond(&sync.Mutex{})
 	s.checkEnd = false
 	s.lock = &sync.Mutex{}
+	return s
 }
 
 // 被processd调用，通知agentd需要上报的traceid
@@ -259,7 +261,7 @@ func (s *agentServer) CheckTargetData() {
 			//s.traceMap.Load(traceId)
 			if checkIsTarget(span[tagi:]) {
 				s.traceMap.LoadOrStore(traceId, true)
-				stream.Send(&pb.TargetInfo{Traceid: traceId, Checkcur: s.checkOffset.Cur})
+				//stream.Send(&pb.TargetInfo{Traceid: traceId, Checkcur: s.checkOffset.Cur})
 			}
 		}
 		for _, o := range s.checkOffset.SlideCur(offset, true) {

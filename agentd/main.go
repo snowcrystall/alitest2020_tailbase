@@ -34,8 +34,7 @@ func main() {
 		f := startDebug()
 		defer stopDebug(f)
 	}
-	var srv agentServer
-	srv.initServer(opt)
+	srv := NewAgentServerV2(opt)
 	go srv.StartGrpcServer()
 	go srv.StartHttpServer()
 

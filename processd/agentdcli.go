@@ -13,12 +13,17 @@ import (
 type agentdCli struct {
 	conn              *grpc.ClientConn
 	addr              string
-	NodifyTraceIdChan chan [2]int64
+	NodifyTraceIdChan chan *peerInfo
 	wg                *sync.WaitGroup
 }
 
+type peerInfo struct {
+	checkCur int64
+	traceId  []byte
+}
+
 func NewAgentdCli(addr string) *agentdCli {
-	return &agentdCli{nil, addr, make(chan [2]int64, 500), &sync.WaitGroup{}}
+	return &agentdCli{nil, addr, make(chan *peerInfo, 500), &sync.WaitGroup{}}
 }
 func (c *agentdCli) Connect() {
 	if c.conn != nil {
@@ -52,7 +57,7 @@ func (c *agentdCli) RunNodifyTraceId() {
 		if !ok {
 			break
 		}
-		stream.Send(&pb.TargetInfo{Traceid: traceIdInfo[0], Checkcur: traceIdInfo[1]})
+		stream.Send(&pb.TargetInfo{Traceid: traceIdInfo.traceId, Checkcur: traceIdInfo.checkCur})
 	}
 	_, err = stream.CloseAndRecv()
 	if err != nil {

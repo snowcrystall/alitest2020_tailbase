@@ -18,8 +18,8 @@ message TraceData {
    bytes tracedata = 1;
 }
 message TargetInfo {
-    int64 traceid = 1;
-    int64 checkcur =2;
+    int64 checkcur =1;
+    bytes traceid = 2;
 }
 message Reply {
     bytes reply = 1;

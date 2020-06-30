@@ -302,7 +302,7 @@ func (s *processServer) SendTargetIds(gs pb.ProcessService_SendTargetIdsServer) 
 			log.Printf("failed to recv: %v", err)
 			//	break
 		}
-		nodifyAgentCli.NodifyTraceIdChan <- [2]int64{in.Traceid, in.Checkcur}
+		nodifyAgentCli.NodifyTraceIdChan <- &peerInfo{in.Checkcur, in.Traceid}
 	}
 	nodifyAgentCli.Close()
 	return nil
