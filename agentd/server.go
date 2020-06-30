@@ -46,16 +46,16 @@ type agentServer struct {
 }
 
 const (
-	BUFSIZE        = 3072 * 1024 * 1024 // data buf size
-	EACH_DOWNLOAD  = 512 * 1024 * 1024  //each download data size
-	CHECK_DISTANCE = 64 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
-	SEND_DISTANCE  = 1536 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
-
-	/*BUFSIZE        = 200 * 1024 * 1024 // data buf size
-	EACH_DOWNLOAD  = 50 * 1024 * 1024  //each download data size
-	CHECK_DISTANCE = 10 * 1024 * 1024  // every download CHECK_DISTANCE data ,it will be check
-	SEND_DISTANCE  = 100 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
+	/*BUFSIZE        = 3072 * 1024 * 1024 // data buf size
+	  EACH_DOWNLOAD  = 512 * 1024 * 1024  //each download data size
+	  CHECK_DISTANCE = 64 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
+	  SEND_DISTANCE  = 1280 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
 	*/
+	BUFSIZE        = 500 * 1024 * 1024 // data buf size
+	EACH_DOWNLOAD  = 100 * 1024 * 1024 //each download data size
+	CHECK_DISTANCE = 20 * 1024 * 1024  // every download CHECK_DISTANCE data ,it will be check
+	SEND_DISTANCE  = 300 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
+
 )
 
 func (s *agentServer) initServer(opt *option) {
@@ -65,8 +65,8 @@ func (s *agentServer) initServer(opt *option) {
 	s.checkOffset = NewOffset()
 	// checkEndChan must bigger than SEND_DISTANCE/CHECK_DISTANCE
 	s.checkEndChan = make(chan [2]int64, 500)
-	s.resChan = make(chan *http.Response, 1)                                  // opt.downn
-	s.checkChan = make(chan [2]int64, opt.downn*EACH_DOWNLOAD/CHECK_DISTANCE) // opt.downn*EACH_DOWNLOAD/CHECK_DISTANCE
+	s.resChan = make(chan *http.Response, 5) // opt.downn
+	s.checkChan = make(chan [2]int64, 500)   // opt.downn*EACH_DOWNLOAD/CHECK_DISTANCE
 	s.traceMap = sync.Map{}
 	s.cli = NewProcessdCli(s.opt)
 	s.wg = sync.WaitGroup{}
@@ -250,11 +250,13 @@ func (s *agentServer) CheckTargetData() {
 		buffer := NewBuffer(bs)
 		for {
 			span, traceIdBytes, err := buffer.ReadLineWithTraceId()
+			//_, _, err := buffer.ReadLineWithTraceId()
 			if err == io.EOF {
 				break
 			}
-			tagi := bytes.LastIndexByte(span, '|')
 			traceId := bytesToInt64(traceIdBytes)
+			tagi := bytes.LastIndexByte(span, '|')
+			//s.traceMap.Load(traceId)
 			if checkIsTarget(span[tagi:]) {
 				s.traceMap.LoadOrStore(traceId, true)
 				stream.Send(&pb.TargetInfo{Traceid: traceId, Checkcur: s.checkOffset.Cur})
@@ -268,6 +270,7 @@ func (s *agentServer) CheckTargetData() {
 				s.sendSignal.L.Unlock()
 			}
 		}
+		//s.checkEndChan <- offset
 	}
 	_, err := stream.CloseAndRecv()
 	if err != nil {
@@ -295,7 +298,7 @@ func (s *agentServer) SendRangeData() {
 		}
 		//log.Printf("SendRangeData from %d, to %d ,num: %d ", s.sendCur, offset, offset-s.sendCur)
 		for !s.checkEnd && s.checkOffset.Cur-offset[1] < SEND_DISTANCE {
-			log.Printf("sendCur %d wait for checkCur %d ,offset[1] %d", s.sendOffset.Cur, s.checkOffset.Cur, offset)
+			//		log.Printf("sendCur %d wait for checkCur %d ,offset[1] %d", s.sendOffset.Cur, s.checkOffset.Cur, offset)
 			s.sendSignal.L.Lock()
 			s.sendOffset.Waiting++
 			s.sendSignal.Wait()
@@ -309,6 +312,7 @@ func (s *agentServer) SendRangeData() {
 			s.readSignal.Broadcast()
 			s.readSignal.L.Unlock()
 		}
+		//s.sendOffset.Cur = offset[1]
 	}
 	_, err := stream.CloseAndRecv()
 	if err != nil {

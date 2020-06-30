@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"os"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 )
@@ -21,30 +22,35 @@ func bytesToInt64(a []byte) (u int64) {
 	return u
 }
 
-/*func checkIsTarget(tag []byte) bool {
-	// 找到所有tags中存在 http.status_code 不为 200
-	n := len(tag)
-	if bytes.Equal(tag[n-21:n-4], []byte("http.status_code=")) {
-		if !(tag[n-4] == 50 && tag[n-3] == 48 && tag[n-2] == 48) {
+func checkIsTargetV2(tag []byte) bool {
+	re := regexp.MustCompile(`error=1|http.status_code=\d{3}`)
+	s := re.FindSubmatch(tag)
+	if len(s) == 0 {
+		return false
+	} else {
+		m := s[0]
+		if len(m) == 7 {
+			return true
+		} else if bytes.Equal(m[len(m)-3:], []byte("200")) {
+			if index := bytes.LastIndex(tag, []byte("error=1")); index != -1 {
+				return true
+			}
+
+		} else {
 			return true
 		}
 	}
-
-	//判断error 等于1的调用链路
-	if bytes.Equal(tag[n-8:n-1], []byte("error=1")) {
-		return true
-	}
 	return false
-}*/
+}
 
 func checkIsTarget(tag []byte) bool {
 	//判断error 等于1的调用链路
-	if bytes.Contains(tag, []byte("error=1")) {
+	if index := bytes.LastIndex(tag, []byte("error=1")); index != -1 {
 		return true
 	}
 	// 找到所有tags中存在 http.status_code 不为 200
 	if index := bytes.Index(tag, []byte("http.status_code=")); index != -1 {
-		if !(tag[index+17] == 50 && tag[index+18] == 48 && tag[index+19] == 48) {
+		if !bytes.Equal(tag[index+17:index+20], []byte("200")) {
 			return true
 		}
 	}
