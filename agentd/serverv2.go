@@ -4,6 +4,7 @@ import (
 	"alitest2020_tailbase/pb"
 	"bufio"
 	"bytes"
+	"github.com/cornelk/hashmap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"io"
@@ -30,9 +31,10 @@ type agentServerV2 struct {
 
 	pb.UnimplementedAgentServiceServer //pb grpc
 
-	b          *LinesBuffer
-	checkEnd   bool         // if check gotutines finished
-	traceMap   sync.Map     //target data map
+	b        *LinesBuffer
+	checkEnd bool // if check gotutines finished
+	//traceMap   sync.Map     //target data map
+	traceMap   *hashmap.HashMap
 	cli        *processdCli //processd cli
 	sendNum    int64        //total send num
 	readSignal *sync.Cond   //used for send gorutine to signal read gorutine
@@ -44,7 +46,6 @@ type LinesBuffer struct {
 	Lines     []*LInfo
 	SendLineN int
 	PeerLineN int
-	LInfoPool *sync.Pool
 }
 
 type LInfo struct {
@@ -54,12 +55,12 @@ type LInfo struct {
 }
 
 const (
-	LINEBUFSIZE       = 5000000
-	SENDLINE_DISTANCE = 100000
+	//LINEBUFSIZE       = 5000000
+	//SENDLINE_DISTANCE = 100000
 
-	/*LINEBUFSIZE       = 1000000 // data buf size, 400m ~ 1500000
+	LINEBUFSIZE       = 1000000 // data buf size, 400m ~ 1500000
 	SENDLINE_DISTANCE = 100000  //every check SEND_DISTANCE data,it will be send
-	*/
+
 )
 
 func NewAgentServerV2(opt *option) (s *agentServerV2) {
@@ -67,12 +68,7 @@ func NewAgentServerV2(opt *option) (s *agentServerV2) {
 	s.opt = opt
 	s.b = &LinesBuffer{}
 	s.b.Lines = make([]*LInfo, LINEBUFSIZE, LINEBUFSIZE)
-	s.b.LInfoPool = &sync.Pool{
-		New: func() interface{} {
-			return &LInfo{0, 0, nil}
-		},
-	}
-	s.traceMap = sync.Map{}
+	s.traceMap = &hashmap.HashMap{}
 	s.wgSend = sync.WaitGroup{}
 	s.readSignal = sync.NewCond(&sync.Mutex{})
 	s.sendSignal = sync.NewCond(&sync.Mutex{})
@@ -94,8 +90,8 @@ func (s *agentServerV2) NotifyTargetTraceids(gs pb.AgentService_NotifyTargetTrac
 			log.Printf("failed to recv: %v", err)
 			break
 		}
-		if len(in.Traceid) != 0 {
-			s.traceMap.LoadOrStore(string(in.Traceid), true)
+		if in.Traceid != 0 {
+			s.traceMap.Set(in.Traceid, true)
 		}
 		s.b.PeerLineN = int(in.Checkcur)
 		if s.sendWaiting > 0 || s.b.PeerLineN == -1 {
@@ -160,37 +156,30 @@ func (s *agentServerV2) DealRes(res *http.Response) {
 	var line []byte
 	var err error
 	for {
-		line, err = reader.ReadBytes('\n')
+		line, err = reader.ReadSlice('\n')
 		if err == io.EOF {
-			stream.Send(&pb.TargetInfo{Checkcur: -1, Traceid: []byte{}})
+			stream.Send(&pb.TargetInfo{Traceid: 0, Checkcur: -1})
 			s.b.Lines[i%LINEBUFSIZE] = &LInfo{-1, -1, nil}
 			break
 		}
 		traceIdIndex := bytes.IndexByte(line, '|')
-		linfo := s.b.LInfoPool.Get()
-		linfo.(*LInfo).TraceidIndex = traceIdIndex
-		linfo.(*LInfo).LineN = i
-		linfo.(*LInfo).Line = line
-		if s.b.Lines[i%LINEBUFSIZE] != nil {
+		linfo := &LInfo{traceIdIndex, i, make([]byte, 0, 400)}
+		linfo.Line = append(linfo.Line, line...)
+		if s.b.Lines[i%LINEBUFSIZE] != nil && len(s.b.Lines[i%LINEBUFSIZE].Line) == 0 {
 			log.Printf("read %d wait for SendLineN %d ,", i, s.b.SendLineN)
-			if s.sendWaiting > 0 {
-				s.sendSignal.L.Lock()
-				s.sendSignal.Signal()
-				s.sendSignal.L.Unlock()
-			}
-
 			s.readSignal.L.Lock()
 			s.readWaiting++
 			s.readSignal.Wait()
 			s.readWaiting--
 			s.readSignal.L.Unlock()
 		}
-		s.b.Lines[i%LINEBUFSIZE] = linfo.(*LInfo)
+		s.b.Lines[i%LINEBUFSIZE] = linfo
 		i++
-		traceId := line[:traceIdIndex]
+		traceId := bytesToInt64(line[:traceIdIndex])
 		tagi := bytes.LastIndexByte(line, '|')
-		if checkIsTarget(line[tagi:]) {
-			s.traceMap.LoadOrStore(string(traceId), true)
+		_, ok := s.traceMap.Get(traceId)
+		if !ok && checkIsTarget(line[tagi:]) {
+			s.traceMap.Set(traceId, true)
 			stream.Send(&pb.TargetInfo{Checkcur: int64(i), Traceid: traceId})
 			//log.Printf("%s", traceId)
 		}
@@ -200,7 +189,7 @@ func (s *agentServerV2) DealRes(res *http.Response) {
 				s.sendSignal.Signal()
 				s.sendSignal.L.Unlock()
 			}
-			stream.Send(&pb.TargetInfo{Checkcur: int64(i), Traceid: []byte{}})
+			stream.Send(&pb.TargetInfo{Checkcur: int64(i), Traceid: 0})
 		}
 	}
 	_, err = stream.CloseAndRecv()
@@ -225,7 +214,8 @@ func (s *agentServerV2) SendData() {
 	i := 0
 	for {
 		//log.Printf("SendRangeData from %d, to %d ,num: %d ", s.sendCur, offset, offset-s.sendCur)
-		for s.b.Lines[i%LINEBUFSIZE] == nil || (s.b.PeerLineN != -1 && s.b.PeerLineN-s.b.SendLineN < SENDLINE_DISTANCE) {
+		//for s.b.Lines[i%LINEBUFSIZE] == nil || (s.b.PeerLineN != -1 && s.b.PeerLineN-s.b.SendLineN < SENDLINE_DISTANCE) {
+		for s.b.Lines[i%LINEBUFSIZE] == nil || len(s.b.Lines[i%LINEBUFSIZE].Line) == 0 {
 			//log.Printf("sendLineN %d wait for PeerLineN %d ,nil:%t", s.b.SendLineN, s.b.PeerLineN, s.b.Lines[i%LINEBUFSIZE] == nil)
 			s.sendSignal.L.Lock()
 			s.sendWaiting++
@@ -234,19 +224,17 @@ func (s *agentServerV2) SendData() {
 			s.sendSignal.L.Unlock()
 		}
 		linfo := s.b.Lines[i%LINEBUFSIZE]
-		s.b.Lines[i%LINEBUFSIZE] = nil
 		i++
 		if linfo.LineN == -1 {
 			break
 		}
-		_, ok := s.traceMap.Load(string(linfo.Line[:linfo.TraceidIndex]))
+		_, ok := s.traceMap.Get(linfo.Line[:linfo.TraceidIndex])
 		if ok {
 			stream.Send(&pb.TraceData{Tracedata: linfo.Line})
 			s.sendNum++
 		}
 		s.b.SendLineN = linfo.LineN
-		linfo.Line = nil
-		s.b.LInfoPool.Put(linfo)
+		linfo.Line = linfo.Line[:0]
 		if s.readWaiting > 0 {
 			s.readSignal.L.Lock()
 			s.readSignal.Signal()

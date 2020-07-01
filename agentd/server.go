@@ -3,6 +3,8 @@ package main
 import (
 	"alitest2020_tailbase/pb"
 	"bytes"
+	"context"
+	"github.com/cornelk/hashmap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"io"
@@ -35,26 +37,25 @@ type agentServer struct {
 	sendOffset   *Offset             // the position where data are sending
 	checkOffset  *Offset             // the position where data are checking
 	checkEndChan chan [2]int64       //use for tell send gorutines where data has been checked
-	checkEnd     bool                // if check gotutines finished
+	peerCheckEnd bool                // if check gotutines finished
 	checkChan    chan [2]int64       //use for tell check gorutines where data can be start checking
-	traceMap     sync.Map            //target data map
+	traceMap     *hashmap.HashMap    //target map
 	cli          *processdCli        //processd cli
 	sendNum      int64               //total send num
 	readSignal   *sync.Cond          //used for send gorutine to signal read gorutine
 	sendSignal   *sync.Cond          //used for check gorutine to signal send gorutine
 
+	peerCheckCur int64
 }
 
 const (
-	/*BUFSIZE        = 3072 * 1024 * 1024 // data buf size
-	  EACH_DOWNLOAD  = 512 * 1024 * 1024  //each download data size
-	  CHECK_DISTANCE = 64 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
-	  SEND_DISTANCE  = 1280 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
-	*/
-	BUFSIZE        = 500 * 1024 * 1024 // data buf size
-	EACH_DOWNLOAD  = 100 * 1024 * 1024 //each download data size
-	CHECK_DISTANCE = 20 * 1024 * 1024  // every download CHECK_DISTANCE data ,it will be check
-	SEND_DISTANCE  = 300 * 1024 * 1024 //every check SEND_DISTANCE data,it will be send
+	BUFSIZE        = 3072 * 1024 * 1024 // data buf size
+	EACH_DOWNLOAD  = 256 * 1024 * 1024  //each download data size
+	CHECK_DISTANCE = 64 * 1024 * 1024   // every download CHECK_DISTANCE data ,it will be check
+	//BUFSIZE        = 500 * 1024 * 1024 // data buf size
+	//EACH_DOWNLOAD  = 100 * 1024 * 1024 //each download data size
+	//CHECK_DISTANCE = 20 * 1024 * 1024  // every download CHECK_DISTANCE data ,it will be check
+	SEND_DISTANCE = 300 * 100000 //every check SEND_DISTANCE data,it will be send
 
 )
 
@@ -68,14 +69,14 @@ func NewAgentServer(opt *option) (s *agentServer) {
 	s.checkEndChan = make(chan [2]int64, 500)
 	s.resChan = make(chan *http.Response, 5) // opt.downn
 	s.checkChan = make(chan [2]int64, 500)   // opt.downn*EACH_DOWNLOAD/CHECK_DISTANCE
-	s.traceMap = sync.Map{}
+	s.traceMap = &hashmap.HashMap{}
 	s.cli = NewProcessdCli(s.opt)
 	s.wg = sync.WaitGroup{}
 	s.wgCheck = sync.WaitGroup{}
 	s.wgSend = sync.WaitGroup{}
 	s.readSignal = sync.NewCond(&sync.Mutex{})
 	s.sendSignal = sync.NewCond(&sync.Mutex{})
-	s.checkEnd = false
+	s.peerCheckEnd = false
 	s.lock = &sync.Mutex{}
 	return s
 }
@@ -92,10 +93,21 @@ func (s *agentServer) NotifyTargetTraceids(gs pb.AgentService_NotifyTargetTracei
 			log.Printf("failed to recv: %v", err)
 			break
 		}
-		s.traceMap.LoadOrStore(in.Traceid, true)
+
+		s.traceMap.Set(in.Traceid, true)
+		s.peerCheckCur = in.Checkcur
 	}
 
 	return nil
+}
+
+func (s *agentServer) NotifyPeerFilterOver(ctx context.Context, req *pb.Req) (*pb.Reply, error) {
+	s.peerCheckEnd = true
+	s.sendSignal.L.Lock()
+	s.sendSignal.Broadcast()
+	s.sendSignal.L.Unlock()
+
+	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 
 //下载数据并过滤
@@ -133,11 +145,8 @@ func (s *agentServer) GetData(url string) {
 
 	s.wgCheck.Wait()
 	close(s.checkEndChan)
-	s.checkEnd = true
+	s.cli.NotifyFilterOver()
 	log.Printf("finish check data, time %d ms, %d", (time.Now().UnixNano()-startTime)/1000000, s.checkOffset.Cur)
-	s.sendSignal.L.Lock()
-	s.sendSignal.Broadcast()
-	s.sendSignal.L.Unlock()
 	/*close(s.cli.SendTargetTraceIdChan)
 	s.cli.wg.Wait()
 	log.Printf("finish send target id,time %d ms", (time.Now().UnixNano()-startTime)/1000000)
@@ -260,8 +269,8 @@ func (s *agentServer) CheckTargetData() {
 			tagi := bytes.LastIndexByte(span, '|')
 			//s.traceMap.Load(traceId)
 			if checkIsTarget(span[tagi:]) {
-				s.traceMap.LoadOrStore(traceId, true)
-				//stream.Send(&pb.TargetInfo{Traceid: traceId, Checkcur: s.checkOffset.Cur})
+				s.traceMap.Set(traceId, true)
+				stream.Send(&pb.TargetInfo{Traceid: traceId, Checkcur: s.checkOffset.Cur})
 			}
 		}
 		for _, o := range s.checkOffset.SlideCur(offset, true) {
@@ -272,6 +281,7 @@ func (s *agentServer) CheckTargetData() {
 				s.sendSignal.L.Unlock()
 			}
 		}
+		//stream.Send(&pb.TargetInfo{Traceid: 0, Checkcur: s.checkOffset.Cur})
 		//s.checkEndChan <- offset
 	}
 	_, err := stream.CloseAndRecv()
@@ -299,7 +309,7 @@ func (s *agentServer) SendRangeData() {
 			break
 		}
 		//log.Printf("SendRangeData from %d, to %d ,num: %d ", s.sendCur, offset, offset-s.sendCur)
-		for !s.checkEnd && s.checkOffset.Cur-offset[1] < SEND_DISTANCE {
+		for !s.peerCheckEnd && s.peerCheckCur-offset[1] < SEND_DISTANCE {
 			//		log.Printf("sendCur %d wait for checkCur %d ,offset[1] %d", s.sendOffset.Cur, s.checkOffset.Cur, offset)
 			s.sendSignal.L.Lock()
 			s.sendOffset.Waiting++
@@ -334,7 +344,7 @@ func (s *agentServer) sendRangeData(stream *pb.ProcessService_SendTraceDataClien
 		}
 		//traceIdIndex = bytes.IndexByte(span, '|')
 		traceId := bytesToInt64(traceIdBytes)
-		_, ok := s.traceMap.Load(traceId)
+		_, ok := s.traceMap.Get(traceId)
 		if ok {
 			tosend.Tracedata = span
 			(*stream).Send(tosend)

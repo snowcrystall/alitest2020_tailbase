@@ -45,7 +45,7 @@ func checkIsTargetV2(tag []byte) bool {
 
 func checkIsTarget(tag []byte) bool {
 	//判断error 等于1的调用链路
-	if index := bytes.LastIndex(tag, []byte("error=1")); index != -1 {
+	if index := bytes.Index(tag, []byte("error=1")); index != -1 {
 		return true
 	}
 	// 找到所有tags中存在 http.status_code 不为 200

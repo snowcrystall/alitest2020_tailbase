@@ -18,7 +18,7 @@ const _ = grpc.SupportPackageIsVersion6
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type AgentServiceClient interface {
 	NotifyTargetTraceids(ctx context.Context, opts ...grpc.CallOption) (AgentService_NotifyTargetTraceidsClient, error)
-	NotifyAllFilterOver(ctx context.Context, in *Req, opts ...grpc.CallOption) (*Reply, error)
+	NotifyPeerFilterOver(ctx context.Context, in *Req, opts ...grpc.CallOption) (*Reply, error)
 }
 
 type agentServiceClient struct {
@@ -63,9 +63,9 @@ func (x *agentServiceNotifyTargetTraceidsClient) CloseAndRecv() (*Reply, error) 
 	return m, nil
 }
 
-func (c *agentServiceClient) NotifyAllFilterOver(ctx context.Context, in *Req, opts ...grpc.CallOption) (*Reply, error) {
+func (c *agentServiceClient) NotifyPeerFilterOver(ctx context.Context, in *Req, opts ...grpc.CallOption) (*Reply, error) {
 	out := new(Reply)
-	err := c.cc.Invoke(ctx, "/pb.AgentService/NotifyAllFilterOver", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/pb.AgentService/NotifyPeerFilterOver", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func (c *agentServiceClient) NotifyAllFilterOver(ctx context.Context, in *Req, o
 // for forward compatibility
 type AgentServiceServer interface {
 	NotifyTargetTraceids(AgentService_NotifyTargetTraceidsServer) error
-	NotifyAllFilterOver(context.Context, *Req) (*Reply, error)
+	NotifyPeerFilterOver(context.Context, *Req) (*Reply, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -88,8 +88,8 @@ type UnimplementedAgentServiceServer struct {
 func (*UnimplementedAgentServiceServer) NotifyTargetTraceids(AgentService_NotifyTargetTraceidsServer) error {
 	return status.Errorf(codes.Unimplemented, "method NotifyTargetTraceids not implemented")
 }
-func (*UnimplementedAgentServiceServer) NotifyAllFilterOver(context.Context, *Req) (*Reply, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method NotifyAllFilterOver not implemented")
+func (*UnimplementedAgentServiceServer) NotifyPeerFilterOver(context.Context, *Req) (*Reply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method NotifyPeerFilterOver not implemented")
 }
 func (*UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 
@@ -123,20 +123,20 @@ func (x *agentServiceNotifyTargetTraceidsServer) Recv() (*TargetInfo, error) {
 	return m, nil
 }
 
-func _AgentService_NotifyAllFilterOver_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _AgentService_NotifyPeerFilterOver_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(Req)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(AgentServiceServer).NotifyAllFilterOver(ctx, in)
+		return srv.(AgentServiceServer).NotifyPeerFilterOver(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/pb.AgentService/NotifyAllFilterOver",
+		FullMethod: "/pb.AgentService/NotifyPeerFilterOver",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(AgentServiceServer).NotifyAllFilterOver(ctx, req.(*Req))
+		return srv.(AgentServiceServer).NotifyPeerFilterOver(ctx, req.(*Req))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -146,8 +146,8 @@ var _AgentService_serviceDesc = grpc.ServiceDesc{
 	HandlerType: (*AgentServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "NotifyAllFilterOver",
-			Handler:    _AgentService_NotifyAllFilterOver_Handler,
+			MethodName: "NotifyPeerFilterOver",
+			Handler:    _AgentService_NotifyPeerFilterOver_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

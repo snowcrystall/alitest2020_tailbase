@@ -110,6 +110,16 @@ func (c *processdCli) NotifySendOver() {
 
 }
 
+func (c *processdCli) NotifyFilterOver() {
+	c.Connect()
+	client := pb.NewProcessServiceClient(c.conn)
+	_, err := client.NotifyFilterOver(context.Background(), &pb.Addr{Addr: "localhost:" + c.opt.grpcPort})
+	if err != nil {
+		panic(err)
+	}
+
+}
+
 func (c *processdCli) Close() {
 	if c.conn != nil {
 		c.conn.Close()

@@ -63,7 +63,7 @@ func (s *processServer) broadcastNotifyAllFilterDone() {
 	for _, cli := range s.agentClis {
 		cli.Connect()
 		client := pb.NewAgentServiceClient(cli.conn)
-		_, err := client.NotifyAllFilterOver(context.Background(), &pb.Req{Req: []byte("ok")})
+		_, err := client.NotifyPeerFilterOver(context.Background(), &pb.Req{Req: []byte("ok")})
 		if err != nil {
 			log.Printf("could not greet: %v", err)
 		}
@@ -72,6 +72,18 @@ func (s *processServer) broadcastNotifyAllFilterDone() {
 
 //s.agentPeer 为2个时说明两个agentd都过滤完了
 func (s *processServer) NotifyFilterOver(ctx context.Context, in *pb.Addr) (*pb.Reply, error) {
+	for _, cli := range s.agentClis {
+		if cli.addr == in.Addr {
+			continue
+		}
+		cli.Connect()
+		client := pb.NewAgentServiceClient(cli.conn)
+		_, err := client.NotifyPeerFilterOver(context.Background(), &pb.Req{Req: []byte("ok")})
+		if err != nil {
+			log.Printf("could not greet: %v", err)
+		}
+	}
+
 	return &pb.Reply{Reply: []byte("ok")}, nil
 }
 

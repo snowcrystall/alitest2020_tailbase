@@ -19,7 +19,7 @@ type agentdCli struct {
 
 type peerInfo struct {
 	checkCur int64
-	traceId  []byte
+	traceId  int64
 }
 
 func NewAgentdCli(addr string) *agentdCli {
